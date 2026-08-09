@@ -1,0 +1,80 @@
+name: FastVLM macOS build probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-build-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Inspect and build on Apple silicon
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Report runner environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## macOS build probe"
+            echo
+            echo '```text'
+            sw_vers
+            uname -m
+            system_profiler SPHardwareDataType SPDisplaysDataType
+            xcodebuild -version
+            swift --version
+            df -h .
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Confirm model weights are absent
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d app/FastVLM/model ]]; then
+            echo "Unexpected model directory found in the checkout." >&2
+            exit 1
+          fi
+          echo "No model weights are present; this probe performs a model-free build."
+
+      - name: Resolve Swift packages
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project app/FastVLM.xcodeproj \
+            -scheme "FastVLM App"
+
+      - name: Build unsigned macOS app
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project app/FastVLM.xcodeproj \
+            -scheme "FastVLM App" \
+            -configuration Debug \
+            -destination "platform=macOS" \
+            -derivedDataPath "$RUNNER_TEMP/FastVLMDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/fastvlm-build.log"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastvlm-macos-build-log
+          path: ${{ runner.temp }}/fastvlm-build.log
+          if-no-files-found: ignore
+          retention-days: 7
