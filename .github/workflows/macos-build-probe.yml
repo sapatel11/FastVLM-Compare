@@ -37,7 +37,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Confirm model weights are absent
+      - name: Confirm model weights are absent from Git
         shell: bash
         run: |
           set -euo pipefail
@@ -45,7 +45,17 @@ jobs:
             echo "Unexpected model directory found in the checkout." >&2
             exit 1
           fi
-          echo "No model weights are present; this probe performs a model-free build."
+          echo "No model weights are present in the repository checkout."
+
+      - name: Download upstream FastVLM-0.5B FP16 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x app/get_pretrained_mlx_model.sh
+          app/get_pretrained_mlx_model.sh \
+            --model 0.5b \
+            --dest app/FastVLM/model
+          echo "Downloaded model footprint: $(du -sh app/FastVLM/model | cut -f1)"
 
       - name: Resolve Swift packages
         shell: bash
