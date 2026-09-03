@@ -4,9 +4,15 @@
 //
 
 import AVFoundation
+import CoreImage
 import MLXLMCommon
 import SwiftUI
 import Video
+
+#if os(macOS)
+import AppKit
+import UniformTypeIdentifiers
+#endif
 
 // support swift 6
 extension CVImageBuffer: @unchecked @retroactive Sendable {}
@@ -29,6 +35,13 @@ struct ContentView: View {
 
     @State private var selectedCameraType: CameraType = .continuous
     @State private var isEditingPrompt: Bool = false
+
+    #if os(macOS)
+    @State private var selectedImageData: Data?
+    @State private var selectedImageName = "No image selected"
+    @State private var isShowingImageImporter = false
+    @State private var imageImportError: String?
+    #endif
 
     var toolbarItemPlacement: ToolbarItemPlacement {
         var placement: ToolbarItemPlacement = .navigation
@@ -57,104 +70,11 @@ struct ContentView: View {
         NavigationStack {
             Form {
                 Section {
-                    VStack(alignment: .leading, spacing: 10.0) {
-                        Picker("Camera Type", selection: $selectedCameraType) {
-                            ForEach(CameraType.allCases, id: \.self) { cameraType in
-                                Text(cameraType.rawValue.capitalized).tag(cameraType)
-                            }
-                        }
-                        // Prevent macOS from adding a text label for the picker
-                        .labelsHidden()
-                        .pickerStyle(.segmented)
-                        .onChange(of: selectedCameraType) { _, _ in
-                            // Cancel any in-flight requests when switching modes
-                            model.cancel()
-                        }
-
-                        if let framesToDisplay {
-                            VideoFrameView(
-                                frames: framesToDisplay,
-                                cameraType: selectedCameraType,
-                                action: { frame in
-                                    processSingleFrame(frame)
-                                })
-                                // Because we're using the AVCaptureSession preset
-                                // `.vga640x480`, we can assume this aspect ratio
-                                .aspectRatio(4/3, contentMode: .fit)
-                                #if os(macOS)
-                                .frame(maxWidth: 750)
-                                #endif
-                                .overlay(alignment: .top) {
-                                    if !model.promptTime.isEmpty {
-                                        Text("TTFT \(model.promptTime)")
-                                            .font(.caption)
-                                            .foregroundStyle(.white)
-                                            .monospaced()
-                                            .padding(.vertical, 4.0)
-                                            .padding(.horizontal, 6.0)
-                                            .background(alignment: .center) {
-                                                RoundedRectangle(cornerRadius: 8)
-                                                    .fill(Color.black.opacity(0.6))
-                                            }
-                                            .padding(.top)
-                                    }
-                                }
-                                #if !os(macOS)
-                                .overlay(alignment: .topTrailing) {
-                                    CameraControlsView(
-                                        backCamera: $camera.backCamera,
-                                        device: $camera.device,
-                                        devices: $camera.devices)
-                                    .padding()
-                                }
-                                #endif
-                                .overlay(alignment: .bottom) {
-                                    if selectedCameraType == .continuous {
-                                        Group {
-                                            if model.evaluationState == .processingPrompt {
-                                                HStack {
-                                                    ProgressView()
-                                                        .tint(self.statusTextColor)
-                                                        .controlSize(.small)
-
-                                                    Text(model.evaluationState.rawValue)
-                                                }
-                                            } else if model.evaluationState == .idle {
-                                                HStack(spacing: 6.0) {
-                                                    Image(systemName: "clock.fill")
-                                                        .font(.caption)
-
-                                                    Text(model.evaluationState.rawValue)
-                                                }
-                                            }
-                                            else {
-                                                // I'm manually tweaking the spacing to
-                                                // better match the spacing with ProgressView
-                                                HStack(spacing: 6.0) {
-                                                    Image(systemName: "lightbulb.fill")
-                                                        .font(.caption)
-
-                                                    Text(model.evaluationState.rawValue)
-                                                }
-                                            }
-                                        }
-                                        .foregroundStyle(self.statusTextColor)
-                                        .font(.caption)
-                                        .bold()
-                                        .padding(.vertical, 6.0)
-                                        .padding(.horizontal, 8.0)
-                                        .background(self.statusBackgroundColor)
-                                        .clipShape(.capsule)
-                                        .padding(.bottom)
-                                    }
-                                }
-                                #if os(macOS)
-                                .frame(maxWidth: .infinity)
-                                .frame(minWidth: 500)
-                                .frame(minHeight: 375)
-                                #endif
-                        }
-                    }
+                    #if os(macOS)
+                    macOSImageSection
+                    #else
+                    cameraSection
+                    #endif
                 }
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(Color.clear)
@@ -197,9 +117,11 @@ struct ContentView: View {
             #elseif os(macOS)
             .padding()
             #endif
+            #if !os(macOS)
             .task {
                 camera.start()
             }
+            #endif
             .task {
                 await model.load()
             }
@@ -215,6 +137,7 @@ struct ContentView: View {
             }
             #endif
 
+            #if !os(macOS)
             // task to distribute video frames -- this will cancel
             // and restart when the view is on/off screen.  note: it is
             // important that this is here (attached to the VideoFrameView)
@@ -226,6 +149,7 @@ struct ContentView: View {
 
                 await distributeVideoFrames()
             }
+            #endif
 
             .navigationTitle("FastVLM")
             #if os(iOS)
@@ -277,8 +201,170 @@ struct ContentView: View {
             .sheet(isPresented: $isShowingInfo) {
                 InfoView()
             }
+            #if os(macOS)
+            .fileImporter(
+                isPresented: $isShowingImageImporter,
+                allowedContentTypes: [.image],
+                allowsMultipleSelection: false
+            ) { result in
+                importImage(from: result)
+            }
+            #endif
         }
     }
+
+    #if os(macOS)
+    var macOSImageSection: some View {
+        VStack(alignment: .leading, spacing: 12.0) {
+            if let selectedImageData,
+               let image = NSImage(data: selectedImageData) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity, minHeight: 300, maxHeight: 500)
+                    .background(Color.secondary.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+            } else {
+                ContentUnavailableView(
+                    "Select an image",
+                    systemImage: "photo",
+                    description: Text("Choose a local image to analyze with FastVLM.")
+                )
+                .frame(maxWidth: .infinity, minHeight: 300)
+            }
+
+            HStack(spacing: 12.0) {
+                Button("Choose Image…") {
+                    isShowingImageImporter = true
+                }
+
+                Text(selectedImageName)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Spacer()
+
+                Button {
+                    processSelectedImage()
+                } label: {
+                    Label(model.running ? "Running…" : "Run FastVLM", systemImage: "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(selectedImageData == nil || model.running)
+            }
+
+            if !model.promptTime.isEmpty {
+                Text("TTFT \(model.promptTime)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospaced()
+            }
+
+            if let imageImportError {
+                Text(imageImportError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            if !model.modelInfo.isEmpty && model.modelInfo != "Loaded" {
+                Text(model.modelInfo)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+    #else
+    var cameraSection: some View {
+        VStack(alignment: .leading, spacing: 10.0) {
+            Picker("Camera Type", selection: $selectedCameraType) {
+                ForEach(CameraType.allCases, id: \.self) { cameraType in
+                    Text(cameraType.rawValue.capitalized).tag(cameraType)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .onChange(of: selectedCameraType) { _, _ in
+                // Cancel any in-flight requests when switching modes
+                model.cancel()
+            }
+
+            if let framesToDisplay {
+                VideoFrameView(
+                    frames: framesToDisplay,
+                    cameraType: selectedCameraType,
+                    action: { frame in
+                        processSingleFrame(frame)
+                    })
+                    // Because we're using the AVCaptureSession preset
+                    // `.vga640x480`, we can assume this aspect ratio
+                    .aspectRatio(4/3, contentMode: .fit)
+                    .overlay(alignment: .top) {
+                        if !model.promptTime.isEmpty {
+                            Text("TTFT \(model.promptTime)")
+                                .font(.caption)
+                                .foregroundStyle(.white)
+                                .monospaced()
+                                .padding(.vertical, 4.0)
+                                .padding(.horizontal, 6.0)
+                                .background(alignment: .center) {
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(Color.black.opacity(0.6))
+                                }
+                                .padding(.top)
+                        }
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        CameraControlsView(
+                            backCamera: $camera.backCamera,
+                            device: $camera.device,
+                            devices: $camera.devices)
+                        .padding()
+                    }
+                    .overlay(alignment: .bottom) {
+                        if selectedCameraType == .continuous {
+                            Group {
+                                if model.evaluationState == .processingPrompt {
+                                    HStack {
+                                        ProgressView()
+                                            .tint(self.statusTextColor)
+                                            .controlSize(.small)
+
+                                        Text(model.evaluationState.rawValue)
+                                    }
+                                } else if model.evaluationState == .idle {
+                                    HStack(spacing: 6.0) {
+                                        Image(systemName: "clock.fill")
+                                            .font(.caption)
+
+                                        Text(model.evaluationState.rawValue)
+                                    }
+                                }
+                                else {
+                                    // I'm manually tweaking the spacing to
+                                    // better match the spacing with ProgressView
+                                    HStack(spacing: 6.0) {
+                                        Image(systemName: "lightbulb.fill")
+                                            .font(.caption)
+
+                                        Text(model.evaluationState.rawValue)
+                                    }
+                                }
+                            }
+                            .foregroundStyle(self.statusTextColor)
+                            .font(.caption)
+                            .bold()
+                            .padding(.vertical, 6.0)
+                            .padding(.horizontal, 8.0)
+                            .background(self.statusBackgroundColor)
+                            .clipShape(.capsule)
+                            .padding(.bottom)
+                        }
+                    }
+            }
+        }
+    }
+    #endif
 
     var promptSummary: some View {
         Section("Prompt") {
@@ -358,6 +444,73 @@ struct ContentView: View {
             #endif
         }
     }
+
+    #if os(macOS)
+    func importImage(from result: Result<[URL], Error>) {
+        do {
+            guard let url = try result.get().first else { return }
+            let hasSecurityAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if hasSecurityAccess {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            let data = try Data(contentsOf: url)
+            guard NSImage(data: data) != nil,
+                  CIImage(data: data) != nil else {
+                throw ImageSelectionError.invalidImage
+            }
+
+            selectedImageData = data
+            selectedImageName = url.lastPathComponent
+            imageImportError = nil
+            model.output = ""
+            model.promptTime = ""
+        } catch {
+            selectedImageData = nil
+            selectedImageName = "No image selected"
+            imageImportError = "Could not open image: \(error.localizedDescription)"
+        }
+    }
+
+    func processSelectedImage() {
+        guard let selectedImageData,
+              let image = CIImage(data: selectedImageData) else {
+            imageImportError = "Choose a valid image before running FastVLM."
+            return
+        }
+
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSuffix = promptSuffix.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fullPrompt = [trimmedPrompt, trimmedSuffix]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        guard !fullPrompt.isEmpty else { return }
+
+        imageImportError = nil
+        model.output = ""
+        model.promptTime = ""
+
+        let userInput = UserInput(
+            prompt: .text(fullPrompt),
+            images: [.ciImage(image)]
+        )
+
+        Task {
+            await model.generate(userInput)
+        }
+    }
+
+    enum ImageSelectionError: LocalizedError {
+        case invalidImage
+
+        var errorDescription: String? {
+            "The selected file is not a readable image."
+        }
+    }
+    #endif
 
     func analyzeVideoFrames(_ frames: AsyncStream<CVImageBuffer>) async {
         for await frame in frames {
