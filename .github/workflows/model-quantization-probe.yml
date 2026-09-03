@@ -162,6 +162,24 @@ jobs:
           echo "Checkpoint footprint: $(du -sh "$CHECKPOINT_DIR" | cut -f1)"
           df -h .
 
+      - name: Correct checkpoint embedding metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config_path = Path(os.environ["FASTVLM_CHECKPOINT_DIR"]) / "config.json"
+          config = json.loads(config_path.read_text())
+
+          print("Original tie_word_embeddings:", config.get("tie_word_embeddings"))
+          config["tie_word_embeddings"] = False
+          config_path.write_text(json.dumps(config, indent=2) + "\n")
+          print("Corrected tie_word_embeddings:", config["tie_word_embeddings"])
+          PY
+
       - name: Export shared Core ML vision encoder
         shell: bash
         run: |
