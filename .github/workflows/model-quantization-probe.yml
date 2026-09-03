@@ -143,14 +143,15 @@ jobs:
           unzip -q "$CHECKPOINT_ZIP" -d "$CHECKPOINT_ROOT"
           rm -f "$CHECKPOINT_ZIP"
 
-          mapfile -t CONFIGS < <(find "$CHECKPOINT_ROOT" -maxdepth 3 -type f -name config.json -print)
-          if [[ ${#CONFIGS[@]} -ne 1 ]]; then
-            echo "Expected exactly one top-level model config, found ${#CONFIGS[@]}." >&2
-            printf '%s\n' "${CONFIGS[@]}" >&2
+          CONFIG_COUNT="$(find "$CHECKPOINT_ROOT" -maxdepth 3 -type f -name config.json -print | wc -l | tr -d ' ')"
+          if [[ "$CONFIG_COUNT" -ne 1 ]]; then
+            echo "Expected exactly one top-level model config, found $CONFIG_COUNT." >&2
+            find "$CHECKPOINT_ROOT" -maxdepth 3 -type f -name config.json -print >&2
             exit 1
           fi
 
-          CHECKPOINT_DIR="$(dirname "${CONFIGS[0]}")"
+          CONFIG_PATH="$(find "$CHECKPOINT_ROOT" -maxdepth 3 -type f -name config.json -print | head -n 1)"
+          CHECKPOINT_DIR="$(dirname "$CONFIG_PATH")"
           if ! compgen -G "$CHECKPOINT_DIR/*.safetensors" > /dev/null; then
             echo "No safetensors were found in $CHECKPOINT_DIR." >&2
             exit 1
@@ -168,14 +169,15 @@ jobs:
           python model_export/export_vision_encoder.py \
             --model-path "$FASTVLM_CHECKPOINT_DIR"
 
-          mapfile -t COREML_PACKAGES < <(find "$FASTVLM_CHECKPOINT_DIR" -maxdepth 1 -type d -name '*.mlpackage' -print)
-          if [[ ${#COREML_PACKAGES[@]} -ne 1 ]]; then
-            echo "Expected one Core ML vision package, found ${#COREML_PACKAGES[@]}." >&2
+          COREML_COUNT="$(find "$FASTVLM_CHECKPOINT_DIR" -maxdepth 1 -type d -name '*.mlpackage' -print | wc -l | tr -d ' ')"
+          if [[ "$COREML_COUNT" -ne 1 ]]; then
+            echo "Expected one Core ML vision package, found $COREML_COUNT." >&2
             exit 1
           fi
 
-          echo "Vision package: ${COREML_PACKAGES[0]}"
-          echo "Vision footprint: $(du -sh "${COREML_PACKAGES[0]}" | cut -f1)"
+          COREML_PACKAGE="$(find "$FASTVLM_CHECKPOINT_DIR" -maxdepth 1 -type d -name '*.mlpackage' -print | head -n 1)"
+          echo "Vision package: $COREML_PACKAGE"
+          echo "Vision footprint: $(du -sh "$COREML_PACKAGE" | cut -f1)"
 
       - name: Convert 8-bit LLM
         shell: bash
