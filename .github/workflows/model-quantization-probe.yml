@@ -118,10 +118,13 @@ jobs:
           python -m pip install -e "$MLX_VLM_DIR" --no-deps
 
           python - <<'PY'
+          import importlib
           import mlx_vlm
-          from mlx_vlm import convert
+
+          convert_module = importlib.import_module("mlx_vlm.convert")
+
           print("Patched mlx-vlm import succeeded:", mlx_vlm.__file__)
-          print("Converter module:", convert.__file__)
+          print("Converter module:", convert_module.__file__)
           PY
 
       - name: Download upstream FastVLM-0.5B Stage 3 checkpoint
