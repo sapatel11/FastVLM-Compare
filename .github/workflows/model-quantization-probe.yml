@@ -1,0 +1,359 @@
+name: FastVLM 0.5B quantization probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-quantization-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quantize:
+    name: Export 8-bit and 4-bit models on Apple silicon
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    env:
+      FASTVLM_CHECKPOINT_URL: https://ml-site.cdn-apple.com/datasets/fastvlm/llava-fastvithd_0.5b_stage3.zip
+      MLX_VLM_COMMIT: 1884b551bc741f26b2d54d68fa89d4e934b9a3de
+      Q_GROUP_SIZE: "64"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Report runner environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## FastVLM 0.5B quantization probe"
+            echo
+            echo '```text'
+            sw_vers
+            uname -m
+            system_profiler SPHardwareDataType
+            python --version
+            df -h .
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Confirm model weights are absent from Git
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d app/FastVLM/model ]]; then
+            echo "Unexpected model directory found in the checkout." >&2
+            exit 1
+          fi
+          echo "No app model weights are present in the repository checkout."
+
+      - name: Install FastVLM export dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+
+          # Install the repository itself without its broad training/UI dependency set.
+          python -m pip install -e . --no-deps
+
+          # Pin the packages needed by Apple's exporter and the historical mlx-vlm patch.
+          python -m pip install \
+            torch==2.6.0 \
+            torchvision==0.21.0 \
+            transformers==4.48.3 \
+            tokenizers==0.21.0 \
+            sentencepiece==0.1.99 \
+            accelerate==1.6.0 \
+            peft==0.13.2 \
+            huggingface-hub==0.28.1 \
+            numpy==1.26.4 \
+            scipy==1.13.1 \
+            einops==0.6.1 \
+            einops-exts==0.0.4 \
+            timm==1.0.15 \
+            coremltools==8.2 \
+            mlx==0.22.0 \
+            Pillow==11.1.0 \
+            requests==2.32.3 \
+            opencv-python==4.10.0.84 \
+            shortuuid==1.0.13
+
+          python - <<'PY'
+          import importlib.metadata as metadata
+          import platform
+          import torch
+
+          print("Python:", platform.python_version())
+          print("torch:", torch.__version__)
+          print("MPS available:", torch.backends.mps.is_available())
+          for package in ("coremltools", "mlx", "transformers"):
+              print(f"{package}:", metadata.version(package))
+
+          if platform.machine() != "arm64":
+              raise SystemExit("This probe requires an Apple-silicon runner.")
+          if not torch.backends.mps.is_available():
+              raise SystemExit("PyTorch MPS is unavailable on this runner.")
+          PY
+
+      - name: Prepare patched mlx-vlm converter
+        shell: bash
+        run: |
+          set -euo pipefail
+          MLX_VLM_DIR="$RUNNER_TEMP/mlx-vlm"
+          rm -rf "$MLX_VLM_DIR"
+
+          git clone --filter=blob:none https://github.com/Blaizzy/mlx-vlm.git "$MLX_VLM_DIR"
+          git -C "$MLX_VLM_DIR" checkout "$MLX_VLM_COMMIT"
+          git -C "$MLX_VLM_DIR" apply --check "$GITHUB_WORKSPACE/model_export/fastvlm_mlx-vlm.patch"
+          git -C "$MLX_VLM_DIR" apply "$GITHUB_WORKSPACE/model_export/fastvlm_mlx-vlm.patch"
+          python -m pip install -e "$MLX_VLM_DIR" --no-deps
+
+          python - <<'PY'
+          import mlx_vlm
+          from mlx_vlm import convert
+          print("Patched mlx-vlm import succeeded:", mlx_vlm.__file__)
+          print("Converter module:", convert.__file__)
+          PY
+
+      - name: Download upstream FastVLM-0.5B Stage 3 checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHECKPOINT_ROOT="$RUNNER_TEMP/fastvlm-checkpoint"
+          CHECKPOINT_ZIP="$RUNNER_TEMP/fastvlm-0.5b-stage3.zip"
+
+          rm -rf "$CHECKPOINT_ROOT" "$CHECKPOINT_ZIP"
+          mkdir -p "$CHECKPOINT_ROOT"
+
+          curl --fail --location --retry 4 --retry-delay 5 \
+            --output "$CHECKPOINT_ZIP" \
+            "$FASTVLM_CHECKPOINT_URL"
+          unzip -q "$CHECKPOINT_ZIP" -d "$CHECKPOINT_ROOT"
+          rm -f "$CHECKPOINT_ZIP"
+
+          mapfile -t CONFIGS < <(find "$CHECKPOINT_ROOT" -maxdepth 3 -type f -name config.json -print)
+          if [[ ${#CONFIGS[@]} -ne 1 ]]; then
+            echo "Expected exactly one top-level model config, found ${#CONFIGS[@]}." >&2
+            printf '%s\n' "${CONFIGS[@]}" >&2
+            exit 1
+          fi
+
+          CHECKPOINT_DIR="$(dirname "${CONFIGS[0]}")"
+          if ! compgen -G "$CHECKPOINT_DIR/*.safetensors" > /dev/null; then
+            echo "No safetensors were found in $CHECKPOINT_DIR." >&2
+            exit 1
+          fi
+
+          echo "FASTVLM_CHECKPOINT_DIR=$CHECKPOINT_DIR" >> "$GITHUB_ENV"
+          echo "Checkpoint directory: $CHECKPOINT_DIR"
+          echo "Checkpoint footprint: $(du -sh "$CHECKPOINT_DIR" | cut -f1)"
+          df -h .
+
+      - name: Export shared Core ML vision encoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python model_export/export_vision_encoder.py \
+            --model-path "$FASTVLM_CHECKPOINT_DIR"
+
+          mapfile -t COREML_PACKAGES < <(find "$FASTVLM_CHECKPOINT_DIR" -maxdepth 1 -type d -name '*.mlpackage' -print)
+          if [[ ${#COREML_PACKAGES[@]} -ne 1 ]]; then
+            echo "Expected one Core ML vision package, found ${#COREML_PACKAGES[@]}." >&2
+            exit 1
+          fi
+
+          echo "Vision package: ${COREML_PACKAGES[0]}"
+          echo "Vision footprint: $(du -sh "${COREML_PACKAGES[0]}" | cut -f1)"
+
+      - name: Convert 8-bit LLM
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUTPUT_8BIT="$RUNNER_TEMP/fastvlm-0.5b-int8"
+          rm -rf "$OUTPUT_8BIT"
+
+          python -m mlx_vlm.convert \
+            --hf-path "$FASTVLM_CHECKPOINT_DIR" \
+            --mlx-path "$OUTPUT_8BIT" \
+            --only-llm \
+            --quantize \
+            --q-bits 8 \
+            --q-group-size "$Q_GROUP_SIZE"
+
+          echo "FASTVLM_8BIT_DIR=$OUTPUT_8BIT" >> "$GITHUB_ENV"
+          echo "8-bit footprint: $(du -sh "$OUTPUT_8BIT" | cut -f1)"
+
+      - name: Convert 4-bit LLM
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUTPUT_4BIT="$RUNNER_TEMP/fastvlm-0.5b-int4"
+          rm -rf "$OUTPUT_4BIT"
+
+          python -m mlx_vlm.convert \
+            --hf-path "$FASTVLM_CHECKPOINT_DIR" \
+            --mlx-path "$OUTPUT_4BIT" \
+            --only-llm \
+            --quantize \
+            --q-bits 4 \
+            --q-group-size "$Q_GROUP_SIZE"
+
+          echo "FASTVLM_4BIT_DIR=$OUTPUT_4BIT" >> "$GITHUB_ENV"
+          echo "4-bit footprint: $(du -sh "$OUTPUT_4BIT" | cut -f1)"
+
+      - name: Validate quantized model layouts and sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          models = {
+              8: Path(os.environ["FASTVLM_8BIT_DIR"]),
+              4: Path(os.environ["FASTVLM_4BIT_DIR"]),
+          }
+
+          def file_bytes(path: Path) -> int:
+              return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+          def vision_digest(package: Path) -> str:
+              digest = hashlib.sha256()
+              for path in sorted(p for p in package.rglob("*") if p.is_file()):
+                  digest.update(str(path.relative_to(package)).encode("utf-8"))
+                  with path.open("rb") as handle:
+                      for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                          digest.update(chunk)
+              return digest.hexdigest()
+
+          summary = {}
+          for expected_bits, model_dir in models.items():
+              config_path = model_dir / "config.json"
+              if not config_path.is_file():
+                  raise SystemExit(f"Missing config.json in {model_dir}")
+
+              weight_files = sorted(model_dir.glob("*.safetensors"))
+              if not weight_files:
+                  raise SystemExit(f"Missing safetensors in {model_dir}")
+
+              vision_packages = sorted(model_dir.glob("*.mlpackage"))
+              if len(vision_packages) != 1:
+                  raise SystemExit(
+                      f"Expected one Core ML package in {model_dir}, found {len(vision_packages)}"
+                  )
+
+              config = json.loads(config_path.read_text())
+              quantization = config.get("quantization")
+              if not isinstance(quantization, dict):
+                  raise SystemExit(f"Missing quantization config in {config_path}")
+
+              actual_bits = quantization.get("bits")
+              actual_group = quantization.get("group_size")
+              if actual_bits != expected_bits:
+                  raise SystemExit(
+                      f"Expected {expected_bits}-bit config, found bits={actual_bits!r}"
+                  )
+              if actual_group != 64:
+                  raise SystemExit(
+                      f"Expected group_size=64, found group_size={actual_group!r}"
+                  )
+
+              weight_bytes = sum(path.stat().st_size for path in weight_files)
+              vision_bytes = file_bytes(vision_packages[0])
+              total_bytes = file_bytes(model_dir)
+
+              summary[str(expected_bits)] = {
+                  "quantization": quantization,
+                  "weight_bytes": weight_bytes,
+                  "vision_bytes": vision_bytes,
+                  "total_bytes": total_bytes,
+                  "vision_sha256": vision_digest(vision_packages[0]),
+              }
+
+          if summary["4"]["weight_bytes"] >= summary["8"]["weight_bytes"]:
+              raise SystemExit("4-bit weights are not smaller than 8-bit weights.")
+
+          if summary["4"]["vision_sha256"] != summary["8"]["vision_sha256"]:
+              raise SystemExit("The 4-bit and 8-bit Core ML vision packages differ.")
+
+          output = Path(os.environ["RUNNER_TEMP"]) / "fastvlm-quantization-summary.json"
+          output.write_text(json.dumps(summary, indent=2) + "\n")
+
+          def mib(value: int) -> float:
+              return value / (1024 * 1024)
+
+          lines = [
+              "## Quantization validation",
+              "",
+              "| Variant | LLM weights | Vision encoder | Total model |",
+              "| --- | ---: | ---: | ---: |",
+          ]
+          for bits in (8, 4):
+              item = summary[str(bits)]
+              lines.append(
+                  f"| {bits}-bit | {mib(item['weight_bytes']):.2f} MiB | "
+                  f"{mib(item['vision_bytes']):.2f} MiB | {mib(item['total_bytes']):.2f} MiB |"
+              )
+          lines.extend(
+              [
+                  "",
+                  "The Core ML vision encoder is byte-identical in both variants.",
+                  f"Vision SHA-256: `{summary['8']['vision_sha256']}`",
+              ]
+          )
+
+          print("\n".join(lines))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Smoke inference with 8-bit model
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m mlx_vlm.generate \
+            --model "$FASTVLM_8BIT_DIR" \
+            --image docs/acc_vs_latency_qwen-2.png \
+            --prompt "Describe this image briefly." \
+            --max-tokens 8 \
+            --temperature 0.0
+
+      - name: Smoke inference with 4-bit model
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m mlx_vlm.generate \
+            --model "$FASTVLM_4BIT_DIR" \
+            --image docs/acc_vs_latency_qwen-2.png \
+            --prompt "Describe this image briefly." \
+            --max-tokens 8 \
+            --temperature 0.0
+
+      - name: Upload quantization summary only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastvlm-quantization-summary
+          path: ${{ runner.temp }}/fastvlm-quantization-summary.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Confirm outputs remain ephemeral
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Quantized model directories live only under RUNNER_TEMP and are not uploaded."
+          git status --short
+          df -h .
