@@ -528,6 +528,95 @@ jobs:
               print(key, np.asarray(value).shape, np.asarray(value).dtype, flush=True)
           PY
 
+      - name: Diagnose real-image MLX projector
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKENIZERS_PARALLELISM=false python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import coremltools as ct
+          import mlx.core as mx
+          import numpy as np
+          from mlx_vlm.prompt_utils import apply_chat_template
+          from mlx_vlm.utils import load, load_config, prepare_inputs
+
+          model_dir = Path(os.environ["FASTVLM_8BIT_DIR"])
+          image_path = Path(os.environ["GITHUB_WORKSPACE"]) / "docs/acc_vs_latency_qwen-2.png"
+          packages = list(model_dir.glob("*.mlpackage"))
+          if len(packages) != 1:
+              raise SystemExit(
+                  f"Expected one Core ML package in {model_dir}, found {len(packages)}"
+              )
+
+          print("Loading 8-bit model and processor for projector diagnostic...", flush=True)
+          model, processor = load(
+              str(model_dir),
+              lazy=False,
+              trust_remote_code=True,
+          )
+          config = load_config(model_dir, trust_remote_code=True)
+          prompt = apply_chat_template(
+              processor,
+              config,
+              "Describe this image briefly.",
+              num_images=1,
+          )
+          image_token_index = getattr(model.config, "image_token_index", None)
+
+          print("Preparing real image for projector diagnostic...", flush=True)
+          inputs = prepare_inputs(
+              processor,
+              [str(image_path)],
+              prompt,
+              image_token_index,
+          )
+          pixel_values = inputs["pixel_values"]
+          numpy_pixels = np.array(pixel_values, copy=False)
+
+          vision_model = ct.models.MLModel(
+              str(packages[0]),
+              compute_units=ct.ComputeUnit.CPU_ONLY,
+          )
+          print("Running CPU_ONLY Core ML vision prediction...", flush=True)
+          coreml_output = vision_model.predict({"images": numpy_pixels})
+          coreml_features = coreml_output["image_features"]
+          print(
+              "Core ML features ready:",
+              np.asarray(coreml_features).shape,
+              np.asarray(coreml_features).dtype,
+              flush=True,
+          )
+
+          print("Converting Core ML image_features to MLX...", flush=True)
+          mlx_features = mx.array(coreml_features)
+          mx.eval(mlx_features)
+          print(
+              "Core ML to MLX conversion succeeded:",
+              tuple(mlx_features.shape),
+              mlx_features.dtype,
+              flush=True,
+          )
+
+          print("Running FastVLM multi-modal projector...", flush=True)
+          projected = model.multi_modal_projector(mlx_features)
+          print(
+              "Projector graph created:",
+              tuple(projected.shape),
+              projected.dtype,
+              flush=True,
+          )
+          print("Forcing projector evaluation with mx.eval...", flush=True)
+          mx.eval(projected)
+          print(
+              "FastVLM multi-modal projector succeeded:",
+              tuple(projected.shape),
+              projected.dtype,
+              flush=True,
+          )
+          PY
+
       - name: Diagnose 8-bit CPU-only multimodal generation
         shell: bash
         run: |
