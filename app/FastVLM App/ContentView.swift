@@ -41,6 +41,8 @@ struct ContentView: View {
     @State private var selectedImageName = "No image selected"
     @State private var isShowingImageImporter = false
     @State private var imageImportError: String?
+    @State private var comparisonResults: [FastVLMRunResult] = []
+    @State private var isComparing = false
     #endif
 
     var toolbarItemPlacement: ToolbarItemPlacement {
@@ -108,6 +110,16 @@ struct ContentView: View {
                 }
 
                 #if os(macOS)
+                if !comparisonResults.isEmpty {
+                    Section("8-bit vs 4-bit") {
+                        HStack(alignment: .top, spacing: 16.0) {
+                            ForEach(comparisonResults) { result in
+                                comparisonCard(result)
+                            }
+                        }
+                    }
+                }
+
                 Spacer()
                 #endif
             }
@@ -227,7 +239,7 @@ struct ContentView: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .disabled(model.running)
+                .disabled(model.running || isComparing)
             }
 
             if let selectedImageData,
@@ -251,6 +263,7 @@ struct ContentView: View {
                 Button("Choose Image…") {
                     isShowingImageImporter = true
                 }
+                .disabled(model.running || isComparing)
 
                 Text(selectedImageName)
                     .foregroundStyle(.secondary)
@@ -261,10 +274,17 @@ struct ContentView: View {
                 Button {
                     processSelectedImage()
                 } label: {
-                    Label(model.running ? "Running…" : "Run FastVLM", systemImage: "play.fill")
+                    Label(model.running && !isComparing ? "Running…" : "Run FastVLM", systemImage: "play.fill")
+                }
+                .disabled(selectedImageData == nil || model.running || isComparing)
+
+                Button {
+                    compareSelectedImage()
+                } label: {
+                    Label(isComparing ? "Comparing…" : "Compare 8-bit vs 4-bit", systemImage: "rectangle.split.2x1")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(selectedImageData == nil || model.running)
+                .disabled(selectedImageData == nil || model.running || isComparing)
             }
 
             if !model.promptTime.isEmpty {
@@ -298,6 +318,45 @@ struct ContentView: View {
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    func comparisonCard(_ result: FastVLMRunResult) -> some View {
+        VStack(alignment: .leading, spacing: 10.0) {
+            Text(result.variant.rawValue)
+                .font(.headline)
+
+            Text(result.caption)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, minHeight: 70, alignment: .topLeading)
+
+            Divider()
+
+            Grid(alignment: .leading, horizontalSpacing: 14.0, verticalSpacing: 6.0) {
+                GridRow {
+                    Text("TTFT")
+                    Text("\(Int(result.timeToFirstToken * 1000)) ms")
+                }
+                GridRow {
+                    Text("Total")
+                    Text("\(Int(result.totalLatency * 1000)) ms")
+                }
+                GridRow {
+                    Text("Tokens")
+                    Text("\(result.generatedTokenCount)")
+                }
+                GridRow {
+                    Text("Throughput")
+                    Text(String(format: "%.1f tok/s", result.tokensPerSecond))
+                }
+            }
+            .font(.caption)
+            .monospaced()
+            .foregroundStyle(.secondary)
+        }
+        .padding(14.0)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 12.0))
     }
     #else
     var cameraSection: some View {
@@ -490,6 +549,7 @@ struct ContentView: View {
             selectedImageData = data
             selectedImageName = url.lastPathComponent
             imageImportError = nil
+            comparisonResults = []
             model.output = ""
             model.promptTime = ""
             model.timeToFirstToken = 0
@@ -500,14 +560,15 @@ struct ContentView: View {
             selectedImageData = nil
             selectedImageName = "No image selected"
             imageImportError = "Could not open image: \(error.localizedDescription)"
+            comparisonResults = []
         }
     }
 
-    func processSelectedImage() {
+    func makeSelectedImageInput() -> UserInput? {
         guard let selectedImageData,
               let image = CIImage(data: selectedImageData) else {
             imageImportError = "Choose a valid image before running FastVLM."
-            return
+            return nil
         }
 
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -516,18 +577,46 @@ struct ContentView: View {
             .filter { !$0.isEmpty }
             .joined(separator: " ")
 
-        guard !fullPrompt.isEmpty else { return }
+        guard !fullPrompt.isEmpty else { return nil }
 
-        imageImportError = nil
-        model.output = ""
-
-        let userInput = UserInput(
+        return UserInput(
             prompt: .text(fullPrompt),
             images: [.ciImage(image)]
         )
+    }
+
+    func processSelectedImage() {
+        guard let userInput = makeSelectedImageInput() else { return }
+
+        imageImportError = nil
+        comparisonResults = []
+        model.output = ""
 
         Task {
             await model.generate(userInput)
+        }
+    }
+
+    func compareSelectedImage() {
+        guard let userInput = makeSelectedImageInput() else { return }
+
+        imageImportError = nil
+        comparisonResults = []
+        isComparing = true
+
+        Task { @MainActor in
+            defer { isComparing = false }
+
+            for variant in FastVLMVariant.allCases {
+                model.selectedVariant = variant
+
+                guard let result = await model.generateResult(userInput) else {
+                    imageImportError = "Comparison failed while running the \(variant.rawValue) model."
+                    return
+                }
+
+                comparisonResults.append(result)
+            }
         }
     }
 
