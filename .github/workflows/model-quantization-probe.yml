@@ -381,7 +381,7 @@ jobs:
 
           package = packages[0]
           print("Loading Core ML vision model with CPU_ONLY:", package, flush=True)
-          model = ct.models.MLModel(package, compute_units=ct.ComputeUnit.CPU_ONLY)
+          model = ct.models.MLModel(str(package), compute_units=ct.ComputeUnit.CPU_ONLY)
           spec = model.get_spec()
 
           inputs = list(spec.description.input)
