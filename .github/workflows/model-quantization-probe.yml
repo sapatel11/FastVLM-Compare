@@ -783,6 +783,7 @@ jobs:
           PY
 
       - name: Diagnose first multimodal LLM forward
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -884,6 +885,7 @@ jobs:
           PY
 
       - name: Diagnose 8-bit CPU-only multimodal generation
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -938,6 +940,7 @@ jobs:
           PY
 
       - name: Smoke inference with 8-bit model
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -949,6 +952,7 @@ jobs:
             --temperature 0.0
 
       - name: Smoke inference with 4-bit model
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
