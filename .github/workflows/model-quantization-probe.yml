@@ -741,6 +741,106 @@ jobs:
           )
           PY
 
+      - name: Diagnose first multimodal LLM forward
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKENIZERS_PARALLELISM=false python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import coremltools as ct
+          import mlx.core as mx
+          import numpy as np
+          from mlx_vlm.prompt_utils import apply_chat_template
+          from mlx_vlm.utils import load, load_config, prepare_inputs
+
+          model_dir = Path(os.environ["FASTVLM_8BIT_DIR"])
+          image_path = Path(os.environ["GITHUB_WORKSPACE"]) / "docs/acc_vs_latency_qwen-2.png"
+          packages = list(model_dir.glob("*.mlpackage"))
+          if len(packages) != 1:
+              raise SystemExit(
+                  f"Expected one Core ML package in {model_dir}, found {len(packages)}"
+              )
+
+          print("Loading 8-bit model and processor for first-forward diagnostic...", flush=True)
+          model, processor = load(
+              str(model_dir),
+              lazy=False,
+              trust_remote_code=True,
+          )
+          config = load_config(model_dir, trust_remote_code=True)
+          prompt = apply_chat_template(
+              processor,
+              config,
+              "Describe this image briefly.",
+              num_images=1,
+          )
+          image_token_index = getattr(model.config, "image_token_index", None)
+
+          inputs = prepare_inputs(
+              processor,
+              [str(image_path)],
+              prompt,
+              image_token_index,
+          )
+          input_ids = inputs["input_ids"]
+          pixel_values = inputs["pixel_values"]
+
+          print("Creating text embeddings...", flush=True)
+          inputs_embeds = model.language_model.model.embed_tokens(input_ids)
+          mx.eval(inputs_embeds)
+
+          print("Running CPU_ONLY Core ML vision prediction...", flush=True)
+          vision_model = ct.models.MLModel(
+              str(packages[0]),
+              compute_units=ct.ComputeUnit.CPU_ONLY,
+          )
+          coreml_output = vision_model.predict(
+              {"images": np.array(pixel_values, copy=False)}
+          )
+
+          print("Projecting image features...", flush=True)
+          projected = model.multi_modal_projector(
+              mx.array(coreml_output["image_features"])
+          )
+          mx.eval(projected)
+
+          print("Merging image features into text embeddings...", flush=True)
+          merged = model._merge_input_ids_with_image_features(
+              projected,
+              inputs_embeds,
+              input_ids,
+          )
+          mx.eval(merged)
+          print(
+              "Merged embeddings ready:",
+              tuple(merged.shape),
+              merged.dtype,
+              flush=True,
+          )
+
+          print("Running one multimodal language-model forward pass...", flush=True)
+          logits = model.language_model(
+              input_ids,
+              inputs_embeds=merged,
+          )
+          print(
+              "LLM forward graph created:",
+              tuple(logits.shape),
+              logits.dtype,
+              flush=True,
+          )
+          print("Forcing first multimodal LLM forward with mx.eval...", flush=True)
+          mx.eval(logits)
+          print(
+              "First multimodal LLM forward succeeded:",
+              tuple(logits.shape),
+              logits.dtype,
+              flush=True,
+          )
+          PY
+
       - name: Diagnose 8-bit CPU-only multimodal generation
         shell: bash
         run: |
