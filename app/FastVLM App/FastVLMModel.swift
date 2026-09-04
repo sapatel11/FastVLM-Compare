@@ -20,9 +20,9 @@ enum FastVLMVariant: String, CaseIterable, Identifiable, Sendable {
     var directoryName: String {
         switch self {
         case .int8:
-            return "int8"
+            return "int8.bundle"
         case .int4:
-            return "int4"
+            return "int4.bundle"
         }
     }
 }
