@@ -216,6 +216,20 @@ struct ContentView: View {
     #if os(macOS)
     var macOSImageSection: some View {
         VStack(alignment: .leading, spacing: 12.0) {
+            VStack(alignment: .leading, spacing: 6.0) {
+                Text("Model")
+                    .font(.headline)
+
+                Picker("Model", selection: $model.selectedVariant) {
+                    ForEach(FastVLMVariant.allCases) { variant in
+                        Text(variant.rawValue).tag(variant)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .disabled(model.running)
+            }
+
             if let selectedImageData,
                let image = NSImage(data: selectedImageData) {
                 Image(nsImage: image)
@@ -266,7 +280,7 @@ struct ContentView: View {
                     .foregroundStyle(.red)
             }
 
-            if !model.modelInfo.isEmpty && model.modelInfo != "Loaded" {
+            if !model.modelInfo.isEmpty && !model.modelInfo.hasPrefix("Loaded") {
                 Text(model.modelInfo)
                     .font(.caption)
                     .foregroundStyle(.secondary)
