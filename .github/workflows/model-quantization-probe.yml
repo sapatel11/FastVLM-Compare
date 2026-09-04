@@ -617,6 +617,130 @@ jobs:
           )
           PY
 
+      - name: Diagnose FastVLM embedding merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOKENIZERS_PARALLELISM=false python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import coremltools as ct
+          import mlx.core as mx
+          import numpy as np
+          from mlx_vlm.prompt_utils import apply_chat_template
+          from mlx_vlm.utils import load, load_config, prepare_inputs
+
+          model_dir = Path(os.environ["FASTVLM_8BIT_DIR"])
+          image_path = Path(os.environ["GITHUB_WORKSPACE"]) / "docs/acc_vs_latency_qwen-2.png"
+          packages = list(model_dir.glob("*.mlpackage"))
+          if len(packages) != 1:
+              raise SystemExit(
+                  f"Expected one Core ML package in {model_dir}, found {len(packages)}"
+              )
+
+          print("Loading 8-bit model and processor for merge diagnostic...", flush=True)
+          model, processor = load(
+              str(model_dir),
+              lazy=False,
+              trust_remote_code=True,
+          )
+          config = load_config(model_dir, trust_remote_code=True)
+          prompt = apply_chat_template(
+              processor,
+              config,
+              "Describe this image briefly.",
+              num_images=1,
+          )
+          image_token_index = getattr(model.config, "image_token_index", None)
+
+          inputs = prepare_inputs(
+              processor,
+              [str(image_path)],
+              prompt,
+              image_token_index,
+          )
+          input_ids = inputs["input_ids"]
+          pixel_values = inputs["pixel_values"]
+          print(
+              "Prepared input_ids:",
+              tuple(input_ids.shape),
+              input_ids.dtype,
+              "image_token_index=",
+              image_token_index,
+              flush=True,
+          )
+
+          image_positions = np.where(
+              np.array(input_ids[0], copy=False) == image_token_index
+          )[0].tolist()
+          print(
+              "Image token positions:",
+              image_positions,
+              "count=",
+              len(image_positions),
+              flush=True,
+          )
+
+          print("Creating text token embeddings...", flush=True)
+          inputs_embeds = model.language_model.model.embed_tokens(input_ids)
+          mx.eval(inputs_embeds)
+          print(
+              "Text embeddings ready:",
+              tuple(inputs_embeds.shape),
+              inputs_embeds.dtype,
+              flush=True,
+          )
+
+          vision_model = ct.models.MLModel(
+              str(packages[0]),
+              compute_units=ct.ComputeUnit.CPU_ONLY,
+          )
+          coreml_output = vision_model.predict(
+              {"images": np.array(pixel_values, copy=False)}
+          )
+          projected = model.multi_modal_projector(
+              mx.array(coreml_output["image_features"])
+          )
+          mx.eval(projected)
+          print(
+              "Projected image features ready:",
+              tuple(projected.shape),
+              projected.dtype,
+              "patch_count=",
+              projected.shape[1],
+              flush=True,
+          )
+
+          print(
+              "Merge cardinality check: image_token_positions=",
+              len(image_positions),
+              "projected_patches=",
+              projected.shape[1],
+              flush=True,
+          )
+          print("Running FastVLM image-feature embedding merge...", flush=True)
+          merged = model._merge_input_ids_with_image_features(
+              projected,
+              inputs_embeds,
+              input_ids,
+          )
+          print(
+              "Merge graph created:",
+              tuple(merged.shape),
+              merged.dtype,
+              flush=True,
+          )
+          print("Forcing merged embedding evaluation with mx.eval...", flush=True)
+          mx.eval(merged)
+          print(
+              "FastVLM embedding merge succeeded:",
+              tuple(merged.shape),
+              merged.dtype,
+              flush=True,
+          )
+          PY
+
       - name: Diagnose 8-bit CPU-only multimodal generation
         shell: bash
         run: |
