@@ -27,6 +27,17 @@ enum FastVLMVariant: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+struct FastVLMRunResult: Identifiable, Sendable {
+    let variant: FastVLMVariant
+    let caption: String
+    let timeToFirstToken: TimeInterval
+    let totalLatency: TimeInterval
+    let generatedTokenCount: Int
+    let tokensPerSecond: Double
+
+    var id: FastVLMVariant { variant }
+}
+
 private enum FastVLMVariantError: LocalizedError {
     case missingBundleResources
     case missingModelDirectory(FastVLMVariant)
@@ -250,6 +261,33 @@ class FastVLMModel {
 
         currentTask = task
         return task
+    }
+
+    func generateResult(_ userInput: UserInput) async -> FastVLMRunResult? {
+        let variant = selectedVariant
+        let task = await generate(userInput)
+        _ = await task.result
+
+        let caption = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard selectedVariant == variant,
+              !caption.isEmpty,
+              !caption.hasPrefix("Failed:"),
+              timeToFirstToken > 0,
+              totalLatency >= timeToFirstToken,
+              generatedTokenCount > 0,
+              tokensPerSecond.isFinite,
+              tokensPerSecond > 0 else {
+            return nil
+        }
+
+        return FastVLMRunResult(
+            variant: variant,
+            caption: caption,
+            timeToFirstToken: timeToFirstToken,
+            totalLatency: totalLatency,
+            generatedTokenCount: generatedTokenCount,
+            tokensPerSecond: tokensPerSecond
+        )
     }
 
     private func resetMetrics() {
