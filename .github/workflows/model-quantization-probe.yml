@@ -821,10 +821,11 @@ jobs:
           )
 
           print("Running one multimodal language-model forward pass...", flush=True)
-          logits = model.language_model(
+          output = model.language_model(
               input_ids,
               inputs_embeds=merged,
           )
+          logits = output.logits
           print(
               "LLM forward graph created:",
               tuple(logits.shape),
