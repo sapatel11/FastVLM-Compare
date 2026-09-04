@@ -959,6 +959,166 @@ jobs:
             --max-tokens 8 \
             --temperature 0.0
 
+      - name: Stage quantized artifacts for Swift app
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_MODEL_DIR="$GITHUB_WORKSPACE/app/FastVLM/model"
+          rm -rf "$APP_MODEL_DIR"
+          mkdir -p "$APP_MODEL_DIR/int8" "$APP_MODEL_DIR/int4"
+
+          VISION_8BIT="$(find "$FASTVLM_8BIT_DIR" -maxdepth 1 -type d -name '*.mlpackage' -print | head -n 1)"
+          VISION_4BIT="$(find "$FASTVLM_4BIT_DIR" -maxdepth 1 -type d -name '*.mlpackage' -print | head -n 1)"
+          if [[ -z "$VISION_8BIT" || -z "$VISION_4BIT" ]]; then
+            echo "Both quantized variants must contain a Core ML vision package before staging." >&2
+            exit 1
+          fi
+
+          if ! diff -qr "$VISION_8BIT" "$VISION_4BIT" > /dev/null; then
+            echo "The INT8 and INT4 Core ML vision packages differ during Swift staging." >&2
+            exit 1
+          fi
+
+          find "$FASTVLM_8BIT_DIR" -mindepth 1 -maxdepth 1 ! -name '*.mlpackage' \
+            -exec cp -R {} "$APP_MODEL_DIR/int8/" \;
+          find "$FASTVLM_4BIT_DIR" -mindepth 1 -maxdepth 1 ! -name '*.mlpackage' \
+            -exec cp -R {} "$APP_MODEL_DIR/int4/" \;
+          cp -R "$VISION_8BIT" "$APP_MODEL_DIR/fastvithd.mlpackage"
+
+          if find "$APP_MODEL_DIR/int8" "$APP_MODEL_DIR/int4" -type d -name '*.mlpackage' -print | grep -q .; then
+            echo "Variant directories unexpectedly contain duplicated Core ML packages." >&2
+            exit 1
+          fi
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("app/FastVLM/model")
+          for directory_name, expected_bits in (("int8", 8), ("int4", 4)):
+              model_dir = root / directory_name
+              config_path = model_dir / "config.json"
+              if not config_path.is_file():
+                  raise SystemExit(f"Missing staged config: {config_path}")
+              if not list(model_dir.glob("*.safetensors")):
+                  raise SystemExit(f"Missing staged safetensors in {model_dir}")
+
+              config = json.loads(config_path.read_text())
+              quantization = config.get("quantization")
+              if not isinstance(quantization, dict):
+                  raise SystemExit(f"Missing staged quantization metadata in {config_path}")
+              if quantization.get("bits") != expected_bits:
+                  raise SystemExit(
+                      f"Expected {expected_bits}-bit staged model, found {quantization.get('bits')!r}"
+                  )
+              if quantization.get("group_size") != 64:
+                  raise SystemExit(
+                      f"Expected group_size=64 in {config_path}, "
+                      f"found {quantization.get('group_size')!r}"
+                  )
+
+          vision = root / "fastvithd.mlpackage"
+          if not vision.is_dir():
+              raise SystemExit(f"Missing shared staged vision encoder: {vision}")
+          PY
+
+          echo "APP_MODEL_DIR=$APP_MODEL_DIR" >> "$GITHUB_ENV"
+          echo "Staged native app model layout:"
+          find "$APP_MODEL_DIR" -maxdepth 2 -mindepth 1 -print | sort
+          echo "Staged footprint: $(du -sh "$APP_MODEL_DIR" | cut -f1)"
+
+      - name: Resolve Swift packages for quantized app build
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project app/FastVLM.xcodeproj \
+            -scheme "FastVLM App"
+
+      - name: Build macOS app with quantized variants
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project app/FastVLM.xcodeproj \
+            -scheme "FastVLM App" \
+            -configuration Debug \
+            -destination "platform=macOS" \
+            -derivedDataPath "$RUNNER_TEMP/FastVLMDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/fastvlm-quantized-app-build.log"
+
+      - name: Verify quantized resources in built FastVLM framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_ROOT="$RUNNER_TEMP/FastVLMDerivedData/Build/Products/Debug"
+          FRAMEWORK="$(find "$BUILD_ROOT" -type d -name 'FastVLM.framework' -print | head -n 1)"
+          if [[ -z "$FRAMEWORK" ]]; then
+            echo "Built FastVLM.framework was not found under $BUILD_ROOT." >&2
+            exit 1
+          fi
+
+          INT8_CONFIG="$(find "$FRAMEWORK" -type f -path '*/int8/config.json' -print | head -n 1)"
+          INT4_CONFIG="$(find "$FRAMEWORK" -type f -path '*/int4/config.json' -print | head -n 1)"
+          if [[ -z "$INT8_CONFIG" || -z "$INT4_CONFIG" ]]; then
+            echo "Built FastVLM.framework is missing one or both quantized config directories." >&2
+            echo "Framework resource tree:" >&2
+            find "$FRAMEWORK" -maxdepth 6 -print >&2
+            exit 1
+          fi
+
+          VISION_MODEL_COUNT="$(find "$FRAMEWORK" -type d -name 'fastvithd.mlmodelc' -print | wc -l | tr -d ' ')"
+          if [[ "$VISION_MODEL_COUNT" -ne 1 ]]; then
+            echo "Expected exactly one compiled fastvithd.mlmodelc, found $VISION_MODEL_COUNT." >&2
+            find "$FRAMEWORK" -type d -name '*.mlmodelc' -print >&2
+            exit 1
+          fi
+
+          python - "$INT8_CONFIG" "$INT4_CONFIG" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          for path_text, expected_bits in zip(sys.argv[1:], (8, 4)):
+              path = Path(path_text)
+              config = json.loads(path.read_text())
+              quantization = config.get("quantization")
+              if not isinstance(quantization, dict):
+                  raise SystemExit(f"Missing quantization metadata in built resource {path}")
+              if quantization.get("bits") != expected_bits:
+                  raise SystemExit(
+                      f"Expected {expected_bits}-bit built resource, "
+                      f"found {quantization.get('bits')!r} at {path}"
+                  )
+              if quantization.get("group_size") != 64:
+                  raise SystemExit(
+                      f"Expected group_size=64 at {path}, "
+                      f"found {quantization.get('group_size')!r}"
+                  )
+          PY
+
+          INT8_WEIGHTS="$(find "$(dirname "$INT8_CONFIG")" -maxdepth 1 -type f -name '*.safetensors' -print | wc -l | tr -d ' ')"
+          INT4_WEIGHTS="$(find "$(dirname "$INT4_CONFIG")" -maxdepth 1 -type f -name '*.safetensors' -print | wc -l | tr -d ' ')"
+          if [[ "$INT8_WEIGHTS" -lt 1 || "$INT4_WEIGHTS" -lt 1 ]]; then
+            echo "Built framework is missing quantized safetensors for one or both variants." >&2
+            exit 1
+          fi
+
+          {
+            echo "## Native Swift packaging validation"
+            echo
+            echo "The macOS app built with the Stage 3 INT8 and INT4 artifacts."
+            echo
+            echo "- INT8 config: \`$INT8_CONFIG\`"
+            echo "- INT4 config: \`$INT4_CONFIG\`"
+            echo "- Shared compiled vision models: $VISION_MODEL_COUNT"
+            echo "- INT8 safetensor files: $INT8_WEIGHTS"
+            echo "- INT4 safetensor files: $INT4_WEIGHTS"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Upload quantization summary only
         if: always()
         uses: actions/upload-artifact@v4
@@ -972,7 +1132,20 @@ jobs:
         if: always()
         shell: bash
         run: |
-          set -euo pipefail
-          echo "Quantized model directories live only under RUNNER_TEMP and are not uploaded."
+          set -eo pipefail
+          echo "Removing staged app resources, quantized weights, checkpoint files, and derived build products."
+          rm -rf "$GITHUB_WORKSPACE/app/FastVLM/model"
+          if [[ -n "${FASTVLM_8BIT_DIR:-}" ]]; then
+            rm -rf "$FASTVLM_8BIT_DIR"
+          fi
+          if [[ -n "${FASTVLM_4BIT_DIR:-}" ]]; then
+            rm -rf "$FASTVLM_4BIT_DIR"
+          fi
+          rm -rf \
+            "$RUNNER_TEMP/fastvlm-checkpoint" \
+            "$RUNNER_TEMP/mlx-vlm" \
+            "$RUNNER_TEMP/FastVLMDerivedData"
+
+          echo "No model weights or built app products are uploaded."
           git status --short
           df -h .
