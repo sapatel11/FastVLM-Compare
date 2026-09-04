@@ -1119,6 +1119,76 @@ jobs:
             echo "- INT4 safetensor files: $INT4_WEIGHTS"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: Run native Swift quantized inference probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import plistlib
+          import subprocess
+          from pathlib import Path
+
+          build_root = Path(os.environ["RUNNER_TEMP"]) / "FastVLMDerivedData/Build/Products/Debug"
+          apps = sorted(build_root.glob("*.app"))
+          if len(apps) != 1:
+              raise SystemExit(f"Expected one built macOS app under {build_root}, found {len(apps)}")
+
+          app = apps[0]
+          info_plist = app / "Contents" / "Info.plist"
+          with info_plist.open("rb") as handle:
+              info = plistlib.load(handle)
+
+          executable_name = info.get("CFBundleExecutable")
+          if not executable_name:
+              raise SystemExit(f"CFBundleExecutable is missing from {info_plist}")
+
+          executable = app / "Contents" / "MacOS" / executable_name
+          if not executable.is_file():
+              raise SystemExit(f"Built app executable was not found: {executable}")
+
+          image_path = Path(os.environ["GITHUB_WORKSPACE"]) / "docs/acc_vs_latency_qwen-2.png"
+          if not image_path.is_file():
+              raise SystemExit(f"Runtime probe image was not found: {image_path}")
+
+          env = os.environ.copy()
+          env["FASTVLM_RUNTIME_PROBE"] = "1"
+          env["FASTVLM_RUNTIME_PROBE_IMAGE"] = str(image_path)
+
+          print("Launching native runtime probe:", executable, flush=True)
+          try:
+              result = subprocess.run(
+                  [str(executable)],
+                  env=env,
+                  capture_output=True,
+                  text=True,
+                  timeout=600,
+              )
+          except subprocess.TimeoutExpired as error:
+              raise SystemExit("Native Swift runtime probe timed out after 600 seconds.") from error
+
+          combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+          print(combined_output, flush=True)
+
+          required_markers = (
+              "FASTVLM_RUNTIME_PROBE PASS 8-bit",
+              "FASTVLM_RUNTIME_PROBE PASS 4-bit",
+              "FASTVLM_RUNTIME_PROBE PASS all",
+          )
+          missing = [marker for marker in required_markers if marker not in combined_output]
+
+          if result.returncode != 0:
+              raise SystemExit(f"Native Swift runtime probe exited with code {result.returncode}.")
+          if missing:
+              raise SystemExit(f"Native Swift runtime probe missed PASS markers: {missing}")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write("\n## Native Swift runtime validation\n\n")
+              handle.write("The built macOS app loaded and generated with both quantized variants.\n\n")
+              handle.write("- 8-bit native inference: PASS\n")
+              handle.write("- 4-bit native inference: PASS\n")
+          PY
+
       - name: Upload quantization summary only
         if: always()
         uses: actions/upload-artifact@v4
