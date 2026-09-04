@@ -11,6 +11,36 @@ import MLXLMCommon
 import MLXRandom
 import MLXVLM
 
+enum FastVLMVariant: String, CaseIterable, Identifiable, Sendable {
+    case int8 = "8-bit"
+    case int4 = "4-bit"
+
+    var id: Self { self }
+
+    var directoryName: String {
+        switch self {
+        case .int8:
+            return "int8"
+        case .int4:
+            return "int4"
+        }
+    }
+}
+
+private enum FastVLMVariantError: LocalizedError {
+    case missingBundleResources
+    case missingModelDirectory(FastVLMVariant)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingBundleResources:
+            return "FastVLM bundle resources are unavailable."
+        case .missingModelDirectory(let variant):
+            return "Could not find the \(variant.rawValue) model resources."
+        }
+    }
+}
+
 @Observable
 @MainActor
 class FastVLMModel {
@@ -20,12 +50,17 @@ class FastVLMModel {
     public var output = ""
     public var promptTime: String = ""
 
-    enum LoadState {
-        case idle
-        case loaded(ModelContainer)
+    public var selectedVariant: FastVLMVariant = .int8 {
+        didSet {
+            guard selectedVariant != oldValue else { return }
+            resetForVariantChange()
+        }
     }
 
-    private let modelConfiguration = FastVLM.modelConfiguration
+    enum LoadState {
+        case idle
+        case loaded(FastVLMVariant, ModelContainer)
+    }
 
     /// parameters controlling the output
     let generateParameters = GenerateParameters(temperature: 0.0)
@@ -51,35 +86,64 @@ class FastVLMModel {
         FastVLM.register(modelFactory: VLMModelFactory.shared)
     }
 
-    private func _load() async throws -> ModelContainer {
-        switch loadState {
-        case .idle:
-            // limit the buffer cache
-            MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)
+    private func modelConfiguration(for variant: FastVLMVariant) throws -> ModelConfiguration {
+        let bundle = Bundle(for: FastVLM.self)
+        guard let resourceURL = bundle.resourceURL else {
+            throw FastVLMVariantError.missingBundleResources
+        }
 
-            let modelContainer = try await VLMModelFactory.shared.loadContainer(
-                configuration: modelConfiguration
-            ) {
-                [modelConfiguration] progress in
-                Task { @MainActor in
-                    self.modelInfo =
-                        "Downloading \(modelConfiguration.name): \(Int(progress.fractionCompleted * 100))%"
-                }
+        let candidateDirectories = [
+            resourceURL
+                .appendingPathComponent("model", isDirectory: true)
+                .appendingPathComponent(variant.directoryName, isDirectory: true),
+            resourceURL.appendingPathComponent(variant.directoryName, isDirectory: true),
+        ]
+
+        for directory in candidateDirectories {
+            let configURL = directory.appendingPathComponent("config.json")
+            if FileManager.default.fileExists(atPath: configURL.path) {
+                return ModelConfiguration(directory: directory)
             }
-            self.modelInfo = "Loaded"
-            loadState = .loaded(modelContainer)
-            return modelContainer
+        }
 
-        case .loaded(let modelContainer):
+        throw FastVLMVariantError.missingModelDirectory(variant)
+    }
+
+    private func _load() async throws -> ModelContainer {
+        let variant = selectedVariant
+
+        if case .loaded(let loadedVariant, let modelContainer) = loadState,
+           loadedVariant == variant {
             return modelContainer
         }
+
+        // limit the buffer cache
+        MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)
+
+        let modelConfiguration = try modelConfiguration(for: variant)
+        let modelContainer = try await VLMModelFactory.shared.loadContainer(
+            configuration: modelConfiguration
+        ) {
+            [modelConfiguration, variant] progress in
+            Task { @MainActor in
+                self.modelInfo =
+                    "Loading \(variant.rawValue): \(Int(progress.fractionCompleted * 100))%"
+            }
+        }
+
+        if selectedVariant == variant {
+            self.modelInfo = "Loaded \(variant.rawValue)"
+            loadState = .loaded(variant, modelContainer)
+        }
+
+        return modelContainer
     }
 
     public func load() async {
         do {
             _ = try await _load()
         } catch {
-            self.modelInfo = "Error loading model: \(error)"
+            self.modelInfo = "Error loading \(selectedVariant.rawValue) model: \(error.localizedDescription)"
         }
     }
 
@@ -89,7 +153,7 @@ class FastVLMModel {
         }
 
         running = true
-        
+
         // Cancel any existing task
         currentTask?.cancel()
 
@@ -100,20 +164,20 @@ class FastVLMModel {
 
                 // each time you generate you will get something new
                 MLXRandom.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
-                
+
                 // Check if task was cancelled
                 if Task.isCancelled { return }
 
                 let result = try await modelContainer.perform { context in
                     // Measure the time it takes to prepare the input
-                    
+
                     Task { @MainActor in
                         evaluationState = .processingPrompt
                     }
 
                     let llmStart = Date()
                     let input = try await context.processor.prepare(input: userInput)
-                    
+
                     var seenFirstToken = false
 
                     // FastVLM generates the output
@@ -127,7 +191,7 @@ class FastVLMModel {
 
                         if !seenFirstToken {
                             seenFirstToken = true
-                            
+
                             // produced first token, update the time to first token,
                             // the processing state and start displaying the text
                             let llmDuration = Date().timeIntervalSince(llmStart)
@@ -153,11 +217,11 @@ class FastVLMModel {
                             return .more
                         }
                     }
-                    
+
                     // Return the duration of the LLM and the result
                     return result
                 }
-                
+
                 // Check if task was cancelled before updating UI
                 if !Task.isCancelled {
                     self.output = result.output
@@ -175,11 +239,22 @@ class FastVLMModel {
 
             running = false
         }
-        
+
         currentTask = task
         return task
     }
-    
+
+    private func resetForVariantChange() {
+        currentTask?.cancel()
+        currentTask = nil
+        loadState = .idle
+        running = false
+        evaluationState = .idle
+        modelInfo = ""
+        output = ""
+        promptTime = ""
+    }
+
     public func cancel() {
         currentTask?.cancel()
         currentTask = nil
