@@ -965,7 +965,7 @@ jobs:
           set -euo pipefail
           APP_MODEL_DIR="$GITHUB_WORKSPACE/app/FastVLM/model"
           rm -rf "$APP_MODEL_DIR"
-          mkdir -p "$APP_MODEL_DIR/int8" "$APP_MODEL_DIR/int4"
+          mkdir -p "$APP_MODEL_DIR/int8.bundle" "$APP_MODEL_DIR/int4.bundle"
 
           VISION_8BIT="$(find "$FASTVLM_8BIT_DIR" -maxdepth 1 -type d -name '*.mlpackage' -print | head -n 1)"
           VISION_4BIT="$(find "$FASTVLM_4BIT_DIR" -maxdepth 1 -type d -name '*.mlpackage' -print | head -n 1)"
@@ -980,13 +980,13 @@ jobs:
           fi
 
           find "$FASTVLM_8BIT_DIR" -mindepth 1 -maxdepth 1 ! -name '*.mlpackage' \
-            -exec cp -R {} "$APP_MODEL_DIR/int8/" \;
+            -exec cp -R {} "$APP_MODEL_DIR/int8.bundle/" \;
           find "$FASTVLM_4BIT_DIR" -mindepth 1 -maxdepth 1 ! -name '*.mlpackage' \
-            -exec cp -R {} "$APP_MODEL_DIR/int4/" \;
+            -exec cp -R {} "$APP_MODEL_DIR/int4.bundle/" \;
           cp -R "$VISION_8BIT" "$APP_MODEL_DIR/fastvithd.mlpackage"
 
-          if find "$APP_MODEL_DIR/int8" "$APP_MODEL_DIR/int4" -type d -name '*.mlpackage' -print | grep -q .; then
-            echo "Variant directories unexpectedly contain duplicated Core ML packages." >&2
+          if find "$APP_MODEL_DIR/int8.bundle" "$APP_MODEL_DIR/int4.bundle" -type d -name '*.mlpackage' -print | grep -q .; then
+            echo "Variant bundles unexpectedly contain duplicated Core ML packages." >&2
             exit 1
           fi
 
@@ -995,7 +995,7 @@ jobs:
           from pathlib import Path
 
           root = Path("app/FastVLM/model")
-          for directory_name, expected_bits in (("int8", 8), ("int4", 4)):
+          for directory_name, expected_bits in (("int8.bundle", 8), ("int4.bundle", 4)):
               model_dir = root / directory_name
               config_path = model_dir / "config.json"
               if not config_path.is_file():
@@ -1061,10 +1061,10 @@ jobs:
             exit 1
           fi
 
-          INT8_CONFIG="$(find "$FRAMEWORK" -type f -path '*/int8/config.json' -print | head -n 1)"
-          INT4_CONFIG="$(find "$FRAMEWORK" -type f -path '*/int4/config.json' -print | head -n 1)"
+          INT8_CONFIG="$(find "$FRAMEWORK" -type f -path '*/int8.bundle/config.json' -print | head -n 1)"
+          INT4_CONFIG="$(find "$FRAMEWORK" -type f -path '*/int4.bundle/config.json' -print | head -n 1)"
           if [[ -z "$INT8_CONFIG" || -z "$INT4_CONFIG" ]]; then
-            echo "Built FastVLM.framework is missing one or both quantized config directories." >&2
+            echo "Built FastVLM.framework is missing one or both quantized resource bundles." >&2
             echo "Framework resource tree:" >&2
             find "$FRAMEWORK" -maxdepth 6 -print >&2
             exit 1
