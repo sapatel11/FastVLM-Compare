@@ -268,10 +268,21 @@ struct ContentView: View {
             }
 
             if !model.promptTime.isEmpty {
-                Text("TTFT \(model.promptTime)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .monospaced()
+                HStack(spacing: 16.0) {
+                    Text("TTFT \(model.promptTime)")
+                    if model.totalLatency > 0 {
+                        Text("Total \(Int(model.totalLatency * 1000)) ms")
+                    }
+                    if model.generatedTokenCount > 0 {
+                        Text("Tokens \(model.generatedTokenCount)")
+                    }
+                    if model.tokensPerSecond > 0 {
+                        Text(String(format: "%.1f tok/s", model.tokensPerSecond))
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospaced()
             }
 
             if let imageImportError {
@@ -481,6 +492,10 @@ struct ContentView: View {
             imageImportError = nil
             model.output = ""
             model.promptTime = ""
+            model.timeToFirstToken = 0
+            model.totalLatency = 0
+            model.generatedTokenCount = 0
+            model.tokensPerSecond = 0
         } catch {
             selectedImageData = nil
             selectedImageName = "No image selected"
@@ -505,7 +520,6 @@ struct ContentView: View {
 
         imageImportError = nil
         model.output = ""
-        model.promptTime = ""
 
         let userInput = UserInput(
             prompt: .text(fullPrompt),
