@@ -49,6 +49,10 @@ class FastVLMModel {
     public var modelInfo = ""
     public var output = ""
     public var promptTime: String = ""
+    public var timeToFirstToken: TimeInterval = 0
+    public var totalLatency: TimeInterval = 0
+    public var generatedTokenCount = 0
+    public var tokensPerSecond: Double = 0
 
     public var selectedVariant: FastVLMVariant = .int8 {
         didSet {
@@ -152,6 +156,7 @@ class FastVLMModel {
             return currentTask
         }
 
+        resetMetrics()
         running = true
 
         // Cancel any existing task
@@ -168,14 +173,13 @@ class FastVLMModel {
                 // Check if task was cancelled
                 if Task.isCancelled { return }
 
-                let result = try await modelContainer.perform { context in
-                    // Measure the time it takes to prepare the input
-
+                let (result, measuredTotalLatency) = try await modelContainer.perform { context in
                     Task { @MainActor in
                         evaluationState = .processingPrompt
                     }
 
-                    let llmStart = Date()
+                    // Benchmark timing begins after model loading and before input preparation.
+                    let inferenceStart = Date()
                     let input = try await context.processor.prepare(input: userInput)
 
                     var seenFirstToken = false
@@ -194,11 +198,12 @@ class FastVLMModel {
 
                             // produced first token, update the time to first token,
                             // the processing state and start displaying the text
-                            let llmDuration = Date().timeIntervalSince(llmStart)
+                            let llmDuration = Date().timeIntervalSince(inferenceStart)
                             let text = context.tokenizer.decode(tokens: tokens)
                             Task { @MainActor in
                                 evaluationState = .generatingResponse
                                 self.output = text
+                                self.timeToFirstToken = llmDuration
                                 self.promptTime = "\(Int(llmDuration * 1000)) ms"
                             }
                         }
@@ -218,13 +223,16 @@ class FastVLMModel {
                         }
                     }
 
-                    // Return the duration of the LLM and the result
-                    return result
+                    let measuredTotalLatency = Date().timeIntervalSince(inferenceStart)
+                    return (result, measuredTotalLatency)
                 }
 
                 // Check if task was cancelled before updating UI
                 if !Task.isCancelled {
                     self.output = result.output
+                    self.totalLatency = measuredTotalLatency
+                    self.generatedTokenCount = result.tokens.count
+                    self.tokensPerSecond = result.tokensPerSecond
                 }
 
             } catch {
@@ -244,6 +252,14 @@ class FastVLMModel {
         return task
     }
 
+    private func resetMetrics() {
+        promptTime = ""
+        timeToFirstToken = 0
+        totalLatency = 0
+        generatedTokenCount = 0
+        tokensPerSecond = 0
+    }
+
     private func resetForVariantChange() {
         currentTask?.cancel()
         currentTask = nil
@@ -252,7 +268,7 @@ class FastVLMModel {
         evaluationState = .idle
         modelInfo = ""
         output = ""
-        promptTime = ""
+        resetMetrics()
     }
 
     public func cancel() {
@@ -260,6 +276,6 @@ class FastVLMModel {
         currentTask = nil
         running = false
         output = ""
-        promptTime = ""
+        resetMetrics()
     }
 }
