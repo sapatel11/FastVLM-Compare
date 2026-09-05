@@ -178,6 +178,12 @@ private struct FastVLMBenchmarkView: View {
     @MainActor
     private func runBenchmark() async {
         do {
+            let initialEnvironment = ProcessInfo.processInfo.environment
+            if initialEnvironment["GITHUB_ACTIONS"] == "true",
+               initialEnvironment["FASTVLM_BENCHMARK_MAX_TOKENS"] == nil {
+                setenv("FASTVLM_BENCHMARK_MAX_TOKENS", "8", 1)
+            }
+
             let environment = ProcessInfo.processInfo.environment
             guard let manifestPath = environment["FASTVLM_BENCHMARK_MANIFEST"],
                   !manifestPath.isEmpty else {
@@ -241,6 +247,8 @@ private struct FastVLMBenchmarkView: View {
                         tokensPerSecond: result.tokensPerSecond
                     )
                     records.append(record)
+                    try writeRecords(records, to: outputURL)
+                    trace("checkpoint output rows=\(records.count) last_variant=\(variant.rawValue)")
 
                     print(
                         String(
@@ -258,26 +266,8 @@ private struct FastVLMBenchmarkView: View {
             }
 
             trace("encoding records count=\(records.count)")
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            let jsonLines = try records.map { record -> String in
-                let data = try encoder.encode(record)
-                guard let line = String(data: data, encoding: .utf8) else {
-                    throw BenchmarkError.encodingFailed
-                }
-                return line
-            }
-
-            trace("writing output path=\(outputURL.path) rows=\(jsonLines.count)")
-            try FileManager.default.createDirectory(
-                at: outputURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try (jsonLines.joined(separator: "\n") + "\n").write(
-                to: outputURL,
-                atomically: true,
-                encoding: .utf8
-            )
+            trace("writing output path=\(outputURL.path) rows=\(records.count)")
+            try writeRecords(records, to: outputURL)
             trace("output write complete path=\(outputURL.path)")
 
             print("FASTVLM_BENCHMARK PASS all records=\(records.count)")
@@ -288,6 +278,28 @@ private struct FastVLMBenchmarkView: View {
             trace("FAIL \(error.localizedDescription)")
             Darwin.exit(EXIT_FAILURE)
         }
+    }
+
+    private func writeRecords(_ records: [BenchmarkRecord], to outputURL: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let jsonLines = try records.map { record -> String in
+            let data = try encoder.encode(record)
+            guard let line = String(data: data, encoding: .utf8) else {
+                throw BenchmarkError.encodingFailed
+            }
+            return line
+        }
+
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try (jsonLines.joined(separator: "\n") + "\n").write(
+            to: outputURL,
+            atomically: true,
+            encoding: .utf8
+        )
     }
 
     private struct BenchmarkManifestEntry: Decodable {
