@@ -1,0 +1,7 @@
+[
+  {
+    "image_id": "repo-smoke-001",
+    "image_path": "../docs/acc_vs_latency_qwen-2.png",
+    "prompt": "Describe this image briefly."
+  }
+]
