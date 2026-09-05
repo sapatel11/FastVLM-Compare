@@ -191,6 +191,7 @@ private struct FastVLMBenchmarkView: View {
             let manifestURL = URL(fileURLWithPath: manifestPath).standardizedFileURL
             let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
             trace("manifest=\(manifestURL.path) output=\(outputURL.path)")
+            trace("max_tokens=\(model.effectiveGenerationTokenLimit)")
 
             let manifestData = try Data(contentsOf: manifestURL)
             let entries = try JSONDecoder().decode([BenchmarkManifestEntry].self, from: manifestData)
