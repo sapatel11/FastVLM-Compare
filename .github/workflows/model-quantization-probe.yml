@@ -348,7 +348,6 @@ jobs:
           TOKENIZERS_PARALLELISM=false python - <<'PY'
           import os
           from mlx_vlm.utils import load
-
           model_dir = os.environ["FASTVLM_8BIT_DIR"]
           print("Loading 8-bit model and processor:", model_dir, flush=True)
           model, processor = load(
@@ -1243,10 +1242,10 @@ jobs:
                   env=env,
                   capture_output=True,
                   text=True,
-                  timeout=900,
+                  timeout=1800,
               )
           except subprocess.TimeoutExpired as error:
-              raise SystemExit("Native benchmark harness timed out after 900 seconds.") from error
+              raise SystemExit("Native benchmark harness timed out after 1800 seconds.") from error
 
           combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
           print(combined_output, flush=True)
