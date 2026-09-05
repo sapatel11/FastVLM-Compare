@@ -150,8 +150,29 @@ private struct FastVLMBenchmarkView: View {
     }
 
     private func trace(_ message: String) {
-        print("FASTVLM_BENCHMARK TRACE \(message)")
+        let line = "FASTVLM_BENCHMARK TRACE \(message)"
+        print(line)
         fflush(stdout)
+
+        guard let summaryPath = ProcessInfo.processInfo.environment["GITHUB_STEP_SUMMARY"],
+              !summaryPath.isEmpty else {
+            return
+        }
+
+        let summaryURL = URL(fileURLWithPath: summaryPath)
+        let data = Data(("- `\(line)`\n").utf8)
+        do {
+            if !FileManager.default.fileExists(atPath: summaryURL.path) {
+                FileManager.default.createFile(atPath: summaryURL.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: summaryURL)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {
+            print("FASTVLM_BENCHMARK TRACE summary-write-failed: \(error.localizedDescription)")
+            fflush(stdout)
+        }
     }
 
     @MainActor
@@ -263,8 +284,7 @@ private struct FastVLMBenchmarkView: View {
             fflush(stdout)
             Darwin.exit(EXIT_SUCCESS)
         } catch {
-            print("FASTVLM_BENCHMARK FAIL: \(error.localizedDescription)")
-            fflush(stdout)
+            trace("FAIL \(error.localizedDescription)")
             Darwin.exit(EXIT_FAILURE)
         }
     }
