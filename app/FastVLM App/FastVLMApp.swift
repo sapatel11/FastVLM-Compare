@@ -149,6 +149,11 @@ private struct FastVLMBenchmarkView: View {
             }
     }
 
+    private func trace(_ message: String) {
+        print("FASTVLM_BENCHMARK TRACE \(message)")
+        fflush(stdout)
+    }
+
     @MainActor
     private func runBenchmark() async {
         do {
@@ -164,8 +169,11 @@ private struct FastVLMBenchmarkView: View {
 
             let manifestURL = URL(fileURLWithPath: manifestPath).standardizedFileURL
             let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
+            trace("manifest=\(manifestURL.path) output=\(outputURL.path)")
+
             let manifestData = try Data(contentsOf: manifestURL)
             let entries = try JSONDecoder().decode([BenchmarkManifestEntry].self, from: manifestData)
+            trace("manifest decoded entries=\(entries.count)")
 
             guard !entries.isEmpty else {
                 throw BenchmarkError.emptyManifest
@@ -175,6 +183,7 @@ private struct FastVLMBenchmarkView: View {
             records.reserveCapacity(entries.count * FastVLMVariant.allCases.count)
 
             for entry in entries {
+                trace("entry start image_id=\(entry.imageID)")
                 let imageURL = URL(
                     fileURLWithPath: entry.imagePath,
                     relativeTo: manifestURL.deletingLastPathComponent()
@@ -183,8 +192,10 @@ private struct FastVLMBenchmarkView: View {
                 guard let image = CIImage(data: imageData) else {
                     throw BenchmarkError.invalidImage(entry.imageID, imageURL.path)
                 }
+                trace("image decoded image_id=\(entry.imageID) path=\(imageURL.path)")
 
                 for variant in FastVLMVariant.allCases {
+                    trace("generation start image_id=\(entry.imageID) variant=\(variant.rawValue)")
                     model.selectedVariant = variant
 
                     let userInput = UserInput(
@@ -193,8 +204,10 @@ private struct FastVLMBenchmarkView: View {
                     )
 
                     guard let result = await model.generateResult(userInput) else {
+                        trace("generation returned no valid result image_id=\(entry.imageID) variant=\(variant.rawValue) output=\(model.output)")
                         throw BenchmarkError.generationFailed(entry.imageID, variant, model.output)
                     }
+                    trace("generation finish image_id=\(entry.imageID) variant=\(variant.rawValue)")
 
                     let record = BenchmarkRecord(
                         imageID: entry.imageID,
@@ -218,9 +231,11 @@ private struct FastVLMBenchmarkView: View {
                             record.tokensPerSecond
                         )
                     )
+                    fflush(stdout)
                 }
             }
 
+            trace("encoding records count=\(records.count)")
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             let jsonLines = try records.map { record -> String in
@@ -231,6 +246,7 @@ private struct FastVLMBenchmarkView: View {
                 return line
             }
 
+            trace("writing output path=\(outputURL.path) rows=\(jsonLines.count)")
             try FileManager.default.createDirectory(
                 at: outputURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
@@ -240,12 +256,15 @@ private struct FastVLMBenchmarkView: View {
                 atomically: true,
                 encoding: .utf8
             )
+            trace("output write complete path=\(outputURL.path)")
 
             print("FASTVLM_BENCHMARK PASS all records=\(records.count)")
             print("FASTVLM_BENCHMARK OUTPUT \(outputURL.path)")
+            fflush(stdout)
             Darwin.exit(EXIT_SUCCESS)
         } catch {
             print("FASTVLM_BENCHMARK FAIL: \(error.localizedDescription)")
+            fflush(stdout)
             Darwin.exit(EXIT_FAILURE)
         }
     }
