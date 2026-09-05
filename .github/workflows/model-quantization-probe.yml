@@ -1193,6 +1193,124 @@ jobs:
               handle.write("- 4-bit native inference: PASS\n")
           PY
 
+      - name: Run native benchmark harness smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import math
+          import os
+          import plistlib
+          import subprocess
+          from pathlib import Path
+
+          build_root = Path(os.environ["RUNNER_TEMP"]) / "FastVLMDerivedData/Build/Products/Debug"
+          apps = sorted(build_root.glob("*.app"))
+          if len(apps) != 1:
+              raise SystemExit(f"Expected one built macOS app under {build_root}, found {len(apps)}")
+
+          app = apps[0]
+          info_plist = app / "Contents" / "Info.plist"
+          with info_plist.open("rb") as handle:
+              info = plistlib.load(handle)
+
+          executable_name = info.get("CFBundleExecutable")
+          if not executable_name:
+              raise SystemExit(f"CFBundleExecutable is missing from {info_plist}")
+
+          executable = app / "Contents" / "MacOS" / executable_name
+          if not executable.is_file():
+              raise SystemExit(f"Built app executable was not found: {executable}")
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          manifest = workspace / "benchmark/benchmark_manifest.example.json"
+          if not manifest.is_file():
+              raise SystemExit(f"Benchmark manifest was not found: {manifest}")
+
+          output = Path(os.environ["RUNNER_TEMP"]) / "fastvlm-benchmark-smoke.jsonl"
+          output.unlink(missing_ok=True)
+
+          env = os.environ.copy()
+          env["FASTVLM_BENCHMARK"] = "1"
+          env["FASTVLM_BENCHMARK_MANIFEST"] = str(manifest)
+          env["FASTVLM_BENCHMARK_OUTPUT"] = str(output)
+
+          print("Launching native benchmark harness:", executable, flush=True)
+          try:
+              result = subprocess.run(
+                  [str(executable)],
+                  env=env,
+                  capture_output=True,
+                  text=True,
+                  timeout=900,
+              )
+          except subprocess.TimeoutExpired as error:
+              raise SystemExit("Native benchmark harness timed out after 900 seconds.") from error
+
+          combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+          print(combined_output, flush=True)
+
+          if result.returncode != 0:
+              raise SystemExit(f"Native benchmark harness exited with code {result.returncode}.")
+          if "FASTVLM_BENCHMARK PASS all records=2" not in combined_output:
+              raise SystemExit("Native benchmark harness did not report exactly two successful records.")
+          if not output.is_file():
+              raise SystemExit(f"Native benchmark output was not written: {output}")
+
+          lines = [line for line in output.read_text(encoding="utf-8").splitlines() if line.strip()]
+          if len(lines) != 2:
+              raise SystemExit(f"Expected exactly two benchmark JSONL rows, found {len(lines)}")
+
+          records = [json.loads(line) for line in lines]
+          expected_fields = {
+              "image_id",
+              "variant",
+              "caption",
+              "TTFT_ms",
+              "total_latency_ms",
+              "generated_tokens",
+              "tokens_per_second",
+          }
+          variants = set()
+          for record in records:
+              if set(record) != expected_fields:
+                  raise SystemExit(
+                      f"Benchmark row fields differ from the expected schema: {sorted(record)}"
+                  )
+              if record["image_id"] != "repo-smoke-001":
+                  raise SystemExit(f"Unexpected benchmark image_id: {record['image_id']!r}")
+              if not isinstance(record["caption"], str) or not record["caption"].strip():
+                  raise SystemExit("Benchmark row contains an empty caption.")
+
+              ttft = float(record["TTFT_ms"])
+              total = float(record["total_latency_ms"])
+              tokens = int(record["generated_tokens"])
+              tokens_per_second = float(record["tokens_per_second"])
+              if not math.isfinite(ttft) or ttft <= 0:
+                  raise SystemExit(f"Invalid benchmark TTFT: {ttft}")
+              if not math.isfinite(total) or total < ttft:
+                  raise SystemExit(f"Invalid benchmark total latency: {total}")
+              if tokens <= 0:
+                  raise SystemExit(f"Invalid benchmark generated token count: {tokens}")
+              if not math.isfinite(tokens_per_second) or tokens_per_second <= 0:
+                  raise SystemExit(f"Invalid benchmark tokens/sec: {tokens_per_second}")
+
+              variants.add(record["variant"])
+
+          if variants != {"8-bit", "4-bit"}:
+              raise SystemExit(f"Expected 8-bit and 4-bit benchmark rows, found {sorted(variants)}")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write("\n## Native benchmark harness validation\n\n")
+              handle.write("The built macOS app produced two valid JSONL benchmark records.\n\n")
+              handle.write("- Example image: PASS\n")
+              handle.write("- 8-bit record: PASS\n")
+              handle.write("- 4-bit record: PASS\n")
+              handle.write("- Metrics/schema validation: PASS\n\n")
+              handle.write("These GitHub virtual-M1 measurements are harness smoke data, not scientific benchmark results.\n")
+          PY
+
       - name: Upload quantization summary only
         if: always()
         uses: actions/upload-artifact@v4
@@ -1207,8 +1325,9 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-          echo "Removing staged app resources, quantized weights, checkpoint files, and derived build products."
+          echo "Removing staged app resources, quantized weights, checkpoint files, benchmark smoke output, and derived build products."
           rm -rf "$GITHUB_WORKSPACE/app/FastVLM/model"
+          rm -f "$RUNNER_TEMP/fastvlm-benchmark-smoke.jsonl"
           if [[ -n "${FASTVLM_8BIT_DIR:-}" ]]; then
             rm -rf "$FASTVLM_8BIT_DIR"
           fi
@@ -1220,6 +1339,6 @@ jobs:
             "$RUNNER_TEMP/mlx-vlm" \
             "$RUNNER_TEMP/FastVLMDerivedData"
 
-          echo "No model weights or built app products are uploaded."
+          echo "No model weights, benchmark outputs, or built app products are uploaded."
           git status --short
           df -h .
