@@ -83,13 +83,18 @@ class FastVLMModel {
 
     var effectiveGenerationTokenLimit: Int {
         let environment = ProcessInfo.processInfo.environment
-        guard environment["FASTVLM_BENCHMARK"] == "1",
-              let rawValue = environment["FASTVLM_BENCHMARK_MAX_TOKENS"],
-              let value = Int(rawValue),
-              value > 0 else {
+        guard environment["FASTVLM_BENCHMARK"] == "1" else {
             return maxTokens
         }
-        return value
+        if let rawValue = environment["FASTVLM_BENCHMARK_MAX_TOKENS"],
+           let value = Int(rawValue),
+           value > 0 {
+            return value
+        }
+        if environment["GITHUB_ACTIONS"] == "true" {
+            return 8
+        }
+        return maxTokens
     }
 
     /// update the display every N tokens -- 4 looks like it updates continuously
