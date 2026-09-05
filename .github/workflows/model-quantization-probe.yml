@@ -1245,6 +1245,26 @@ jobs:
                   timeout=1800,
               )
           except subprocess.TimeoutExpired as error:
+              def decode_stream(value):
+                  if value is None:
+                      return ""
+                  if isinstance(value, bytes):
+                      return value.decode("utf-8", errors="replace")
+                  return value
+
+              stdout = decode_stream(error.stdout)
+              stderr = decode_stream(error.stderr)
+              print("FASTVLM_BENCHMARK timeout partial stdout:", flush=True)
+              print(stdout or "<empty>", flush=True)
+              print("FASTVLM_BENCHMARK timeout partial stderr:", flush=True)
+              print(stderr or "<empty>", flush=True)
+              print(
+                  f"FASTVLM_BENCHMARK output exists at timeout: {output.is_file()} path={output}",
+                  flush=True,
+              )
+              if output.is_file():
+                  print("FASTVLM_BENCHMARK partial JSONL:", flush=True)
+                  print(output.read_text(encoding="utf-8", errors="replace") or "<empty>", flush=True)
               raise SystemExit("Native benchmark harness timed out after 1800 seconds.") from error
 
           combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
