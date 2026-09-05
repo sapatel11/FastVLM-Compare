@@ -79,14 +79,18 @@ class FastVLMModel {
 
     /// parameters controlling the output
     let generateParameters = GenerateParameters(temperature: 0.0)
-    let maxTokens: Int = {
+    let maxTokens = 240
+
+    var effectiveGenerationTokenLimit: Int {
         let environment = ProcessInfo.processInfo.environment
-        if environment["FASTVLM_BENCHMARK"] == "1",
-           environment["GITHUB_ACTIONS"] == "true" {
-            return 8
+        guard environment["FASTVLM_BENCHMARK"] == "1",
+              let rawValue = environment["FASTVLM_BENCHMARK_MAX_TOKENS"],
+              let value = Int(rawValue),
+              value > 0 else {
+            return maxTokens
         }
-        return 240
-    }()
+        return value
+    }
 
     /// update the display every N tokens -- 4 looks like it updates continuously
     /// and is low overhead.  observed ~15% reduction in tokens/s when updating
@@ -234,7 +238,7 @@ class FastVLMModel {
                             }
                         }
 
-                        if tokens.count >= maxTokens {
+                        if tokens.count >= effectiveGenerationTokenLimit {
                             return .stop
                         } else {
                             return .more
