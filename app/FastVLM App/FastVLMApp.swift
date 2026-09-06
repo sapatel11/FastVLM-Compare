@@ -178,12 +178,6 @@ private struct FastVLMBenchmarkView: View {
     @MainActor
     private func runBenchmark() async {
         do {
-            let initialEnvironment = ProcessInfo.processInfo.environment
-            if initialEnvironment["GITHUB_ACTIONS"] == "true",
-               initialEnvironment["FASTVLM_BENCHMARK_MAX_TOKENS"] == nil {
-                setenv("FASTVLM_BENCHMARK_MAX_TOKENS", "8", 1)
-            }
-
             let environment = ProcessInfo.processInfo.environment
             guard let manifestPath = environment["FASTVLM_BENCHMARK_MANIFEST"],
                   !manifestPath.isEmpty else {
