@@ -6,6 +6,7 @@
 import SwiftUI
 
 #if os(macOS)
+import AppKit
 import CoreImage
 import Darwin
 import Foundation
@@ -14,6 +15,10 @@ import MLXLMCommon
 
 @main
 struct FastVLMApp: App {
+    #if os(macOS)
+    @NSApplicationDelegateAdaptor(FastVLMAppDelegate.self) private var appDelegate
+    #endif
+
     private let runtimeProbeEnabled =
         ProcessInfo.processInfo.environment["FASTVLM_RUNTIME_PROBE"] == "1"
     private let benchmarkEnabled =
@@ -23,7 +28,7 @@ struct FastVLMApp: App {
         WindowGroup {
             #if os(macOS)
             if benchmarkEnabled {
-                FastVLMBenchmarkView()
+                Text("Running FastVLM benchmark…")
             } else if runtimeProbeEnabled {
                 FastVLMRuntimeProbeView()
             } else {
@@ -37,6 +42,18 @@ struct FastVLMApp: App {
 }
 
 #if os(macOS)
+private final class FastVLMAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard ProcessInfo.processInfo.environment["FASTVLM_BENCHMARK"] == "1" else {
+            return
+        }
+
+        Task { @MainActor in
+            await FastVLMBenchmarkRunner.run()
+        }
+    }
+}
+
 private struct FastVLMRuntimeProbeView: View {
     @State private var model = FastVLMModel()
 
@@ -134,222 +151,6 @@ private struct FastVLMRuntimeProbeView: View {
                 return "\(variant.rawValue) native generation produced invalid \(metric): \(value)."
             case .invalidTokenCount(let variant, let value):
                 return "\(variant.rawValue) native generation produced invalid token count: \(value)."
-            }
-        }
-    }
-}
-
-private struct FastVLMBenchmarkView: View {
-    @State private var model = FastVLMModel()
-
-    var body: some View {
-        Text("Running FastVLM benchmark…")
-            .task {
-                await runBenchmark()
-            }
-    }
-
-    private func trace(_ message: String) {
-        let line = "FASTVLM_BENCHMARK TRACE \(message)"
-        print(line)
-        fflush(stdout)
-
-        guard let summaryPath = ProcessInfo.processInfo.environment["GITHUB_STEP_SUMMARY"],
-              !summaryPath.isEmpty else {
-            return
-        }
-
-        let summaryURL = URL(fileURLWithPath: summaryPath)
-        let data = Data(("- `\(line)`\n").utf8)
-        do {
-            if !FileManager.default.fileExists(atPath: summaryURL.path) {
-                FileManager.default.createFile(atPath: summaryURL.path, contents: nil)
-            }
-            let handle = try FileHandle(forWritingTo: summaryURL)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-        } catch {
-            print("FASTVLM_BENCHMARK TRACE summary-write-failed: \(error.localizedDescription)")
-            fflush(stdout)
-        }
-    }
-
-    @MainActor
-    private func runBenchmark() async {
-        do {
-            let environment = ProcessInfo.processInfo.environment
-            guard let manifestPath = environment["FASTVLM_BENCHMARK_MANIFEST"],
-                  !manifestPath.isEmpty else {
-                throw BenchmarkError.missingManifestPath
-            }
-            guard let outputPath = environment["FASTVLM_BENCHMARK_OUTPUT"],
-                  !outputPath.isEmpty else {
-                throw BenchmarkError.missingOutputPath
-            }
-
-            let manifestURL = URL(fileURLWithPath: manifestPath).standardizedFileURL
-            let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
-            trace("manifest=\(manifestURL.path) output=\(outputURL.path)")
-            trace("max_tokens=\(model.effectiveGenerationTokenLimit)")
-
-            let manifestData = try Data(contentsOf: manifestURL)
-            let entries = try JSONDecoder().decode([BenchmarkManifestEntry].self, from: manifestData)
-            trace("manifest decoded entries=\(entries.count)")
-
-            guard !entries.isEmpty else {
-                throw BenchmarkError.emptyManifest
-            }
-
-            var records: [BenchmarkRecord] = []
-            records.reserveCapacity(entries.count * FastVLMVariant.allCases.count)
-
-            for entry in entries {
-                trace("entry start image_id=\(entry.imageID)")
-                let imageURL = URL(
-                    fileURLWithPath: entry.imagePath,
-                    relativeTo: manifestURL.deletingLastPathComponent()
-                ).standardizedFileURL
-                let imageData = try Data(contentsOf: imageURL)
-                guard let image = CIImage(data: imageData) else {
-                    throw BenchmarkError.invalidImage(entry.imageID, imageURL.path)
-                }
-                trace("image decoded image_id=\(entry.imageID) path=\(imageURL.path)")
-
-                for variant in FastVLMVariant.allCases {
-                    trace("generation start image_id=\(entry.imageID) variant=\(variant.rawValue)")
-                    model.selectedVariant = variant
-
-                    let userInput = UserInput(
-                        prompt: .text(entry.prompt),
-                        images: [.ciImage(image)]
-                    )
-
-                    guard let result = await model.generateResult(userInput) else {
-                        trace("generation returned no valid result image_id=\(entry.imageID) variant=\(variant.rawValue) output=\(model.output)")
-                        throw BenchmarkError.generationFailed(entry.imageID, variant, model.output)
-                    }
-                    trace("generation finish image_id=\(entry.imageID) variant=\(variant.rawValue)")
-
-                    let record = BenchmarkRecord(
-                        imageID: entry.imageID,
-                        variant: variant.rawValue,
-                        caption: result.caption,
-                        ttftMS: result.timeToFirstToken * 1000,
-                        totalLatencyMS: result.totalLatency * 1000,
-                        generatedTokens: result.generatedTokenCount,
-                        tokensPerSecond: result.tokensPerSecond
-                    )
-                    records.append(record)
-                    try writeRecords(records, to: outputURL)
-                    trace("checkpoint output rows=\(records.count) last_variant=\(variant.rawValue)")
-
-                    print(
-                        String(
-                            format: "FASTVLM_BENCHMARK PASS %@ %@ TTFT=%.3fms TOTAL=%.3fms TOKENS=%d TPS=%.3f",
-                            entry.imageID,
-                            variant.rawValue,
-                            record.ttftMS,
-                            record.totalLatencyMS,
-                            record.generatedTokens,
-                            record.tokensPerSecond
-                        )
-                    )
-                    fflush(stdout)
-                }
-            }
-
-            trace("encoding records count=\(records.count)")
-            trace("writing output path=\(outputURL.path) rows=\(records.count)")
-            try writeRecords(records, to: outputURL)
-            trace("output write complete path=\(outputURL.path)")
-
-            print("FASTVLM_BENCHMARK PASS all records=\(records.count)")
-            print("FASTVLM_BENCHMARK OUTPUT \(outputURL.path)")
-            fflush(stdout)
-            Darwin.exit(EXIT_SUCCESS)
-        } catch {
-            trace("FAIL \(error.localizedDescription)")
-            Darwin.exit(EXIT_FAILURE)
-        }
-    }
-
-    private func writeRecords(_ records: [BenchmarkRecord], to outputURL: URL) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let jsonLines = try records.map { record -> String in
-            let data = try encoder.encode(record)
-            guard let line = String(data: data, encoding: .utf8) else {
-                throw BenchmarkError.encodingFailed
-            }
-            return line
-        }
-
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try (jsonLines.joined(separator: "\n") + "\n").write(
-            to: outputURL,
-            atomically: true,
-            encoding: .utf8
-        )
-    }
-
-    private struct BenchmarkManifestEntry: Decodable {
-        let imageID: String
-        let imagePath: String
-        let prompt: String
-
-        enum CodingKeys: String, CodingKey {
-            case imageID = "image_id"
-            case imagePath = "image_path"
-            case prompt
-        }
-    }
-
-    private struct BenchmarkRecord: Encodable {
-        let imageID: String
-        let variant: String
-        let caption: String
-        let ttftMS: Double
-        let totalLatencyMS: Double
-        let generatedTokens: Int
-        let tokensPerSecond: Double
-
-        enum CodingKeys: String, CodingKey {
-            case imageID = "image_id"
-            case variant
-            case caption
-            case ttftMS = "TTFT_ms"
-            case totalLatencyMS = "total_latency_ms"
-            case generatedTokens = "generated_tokens"
-            case tokensPerSecond = "tokens_per_second"
-        }
-    }
-
-    private enum BenchmarkError: LocalizedError {
-        case missingManifestPath
-        case missingOutputPath
-        case emptyManifest
-        case invalidImage(String, String)
-        case generationFailed(String, FastVLMVariant, String)
-        case encodingFailed
-
-        var errorDescription: String? {
-            switch self {
-            case .missingManifestPath:
-                return "FASTVLM_BENCHMARK_MANIFEST was not provided."
-            case .missingOutputPath:
-                return "FASTVLM_BENCHMARK_OUTPUT was not provided."
-            case .emptyManifest:
-                return "The benchmark manifest contains no entries."
-            case .invalidImage(let imageID, let path):
-                return "Benchmark image \(imageID) could not be decoded at \(path)."
-            case .generationFailed(let imageID, let variant, let output):
-                return "Benchmark generation failed for \(imageID) with \(variant.rawValue): \(output)"
-            case .encodingFailed:
-                return "Could not encode a benchmark JSONL record as UTF-8."
             }
         }
     }
