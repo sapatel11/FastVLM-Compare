@@ -1,0 +1,27 @@
+[
+  {
+    "image_id": "chart-latency-001",
+    "image_path": "../docs/acc_vs_latency_qwen-2.png",
+    "prompt": "Briefly summarize the main trend shown in this chart."
+  },
+  {
+    "image_id": "flexible-prompts-001",
+    "image_path": "../docs/fastvlm-flexible_prompts.png",
+    "prompt": "Describe the main visual content of this image briefly."
+  },
+  {
+    "image_id": "counting-001",
+    "image_path": "../docs/fastvlm-counting.gif",
+    "prompt": "Describe the scene and count the most prominent repeated objects."
+  },
+  {
+    "image_id": "emoji-001",
+    "image_path": "../docs/fastvlm-emoji.gif",
+    "prompt": "Describe the scene and identify any prominent emoji or symbol."
+  },
+  {
+    "image_id": "handwriting-001",
+    "image_path": "../docs/fastvlm-handwriting.gif",
+    "prompt": "Read any visible handwritten text and briefly describe the surrounding scene."
+  }
+]

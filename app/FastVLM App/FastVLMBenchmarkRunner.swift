@@ -7,6 +7,7 @@
 import CoreImage
 import Darwin
 import Foundation
+import ImageIO
 import MLXLMCommon
 
 @MainActor
@@ -25,10 +26,16 @@ enum FastVLMBenchmarkRunner {
                 throw BenchmarkError.missingOutputPath
             }
 
+            let variants = try benchmarkVariants(environment)
+            let warmupRuns = try benchmarkWarmupRuns(environment)
+
             let manifestURL = URL(fileURLWithPath: manifestPath).standardizedFileURL
             let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
             trace("manifest=\(manifestURL.path) output=\(outputURL.path)")
             trace("max_tokens=\(model.effectiveGenerationTokenLimit)")
+            trace(
+                "variants=\(variants.map(\.rawValue).joined(separator: ",")) warmup_runs=\(warmupRuns)"
+            )
 
             let manifestData = try Data(contentsOf: manifestURL)
             let entries = try JSONDecoder().decode([BenchmarkManifestEntry].self, from: manifestData)
@@ -38,22 +45,55 @@ enum FastVLMBenchmarkRunner {
                 throw BenchmarkError.emptyManifest
             }
 
+            if warmupRuns > 0 {
+                let warmupEntry = entries[0]
+                let warmupImage = try loadImage(
+                    for: warmupEntry,
+                    relativeTo: manifestURL.deletingLastPathComponent()
+                )
+
+                for variant in variants {
+                    model.selectedVariant = variant
+
+                    for warmupIndex in 1...warmupRuns {
+                        trace(
+                            "warmup start index=\(warmupIndex)/\(warmupRuns) image_id=\(warmupEntry.imageID) variant=\(variant.rawValue)"
+                        )
+
+                        let userInput = UserInput(
+                            prompt: .text(warmupEntry.prompt),
+                            images: [.ciImage(warmupImage)]
+                        )
+
+                        guard await model.generateResult(userInput) != nil else {
+                            trace(
+                                "warmup returned no valid result image_id=\(warmupEntry.imageID) variant=\(variant.rawValue) output=\(model.output)"
+                            )
+                            throw BenchmarkError.generationFailed(
+                                warmupEntry.imageID,
+                                variant,
+                                model.output
+                            )
+                        }
+
+                        trace(
+                            "warmup finish index=\(warmupIndex)/\(warmupRuns) image_id=\(warmupEntry.imageID) variant=\(variant.rawValue)"
+                        )
+                    }
+                }
+            }
+
             var records: [BenchmarkRecord] = []
-            records.reserveCapacity(entries.count * FastVLMVariant.allCases.count)
+            records.reserveCapacity(entries.count * variants.count)
 
             for entry in entries {
                 trace("entry start image_id=\(entry.imageID)")
-                let imageURL = URL(
-                    fileURLWithPath: entry.imagePath,
+                let image = try loadImage(
+                    for: entry,
                     relativeTo: manifestURL.deletingLastPathComponent()
-                ).standardizedFileURL
-                let imageData = try Data(contentsOf: imageURL)
-                guard let image = CIImage(data: imageData) else {
-                    throw BenchmarkError.invalidImage(entry.imageID, imageURL.path)
-                }
-                trace("image decoded image_id=\(entry.imageID) path=\(imageURL.path)")
+                )
 
-                for variant in FastVLMVariant.allCases {
+                for variant in variants {
                     trace("generation start image_id=\(entry.imageID) variant=\(variant.rawValue)")
                     model.selectedVariant = variant
 
@@ -63,7 +103,9 @@ enum FastVLMBenchmarkRunner {
                     )
 
                     guard let result = await model.generateResult(userInput) else {
-                        trace("generation returned no valid result image_id=\(entry.imageID) variant=\(variant.rawValue) output=\(model.output)")
+                        trace(
+                            "generation returned no valid result image_id=\(entry.imageID) variant=\(variant.rawValue) output=\(model.output)"
+                        )
                         throw BenchmarkError.generationFailed(entry.imageID, variant, model.output)
                     }
                     trace("generation finish image_id=\(entry.imageID) variant=\(variant.rawValue)")
@@ -109,6 +151,51 @@ enum FastVLMBenchmarkRunner {
             trace("FAIL \(error.localizedDescription)")
             Darwin.exit(EXIT_FAILURE)
         }
+    }
+
+    private static func benchmarkVariants(_ environment: [String: String]) throws -> [FastVLMVariant] {
+        guard let rawValue = environment["FASTVLM_BENCHMARK_VARIANT"],
+              !rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return FastVLMVariant.allCases
+        }
+
+        switch rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "int8", "8", "8-bit":
+            return [.int8]
+        case "int4", "4", "4-bit":
+            return [.int4]
+        default:
+            throw BenchmarkError.invalidVariant(rawValue)
+        }
+    }
+
+    private static func benchmarkWarmupRuns(_ environment: [String: String]) throws -> Int {
+        guard let rawValue = environment["FASTVLM_BENCHMARK_WARMUP_RUNS"],
+              !rawValue.isEmpty else {
+            return 0
+        }
+        guard let value = Int(rawValue), value >= 0 else {
+            throw BenchmarkError.invalidWarmupRuns(rawValue)
+        }
+        return value
+    }
+
+    private static func loadImage(
+        for entry: BenchmarkManifestEntry,
+        relativeTo manifestDirectory: URL
+    ) throws -> CIImage {
+        let imageURL = URL(
+            fileURLWithPath: entry.imagePath,
+            relativeTo: manifestDirectory
+        ).standardizedFileURL
+        let imageData = try Data(contentsOf: imageURL)
+        guard let source = CGImageSourceCreateWithData(imageData as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw BenchmarkError.invalidImage(entry.imageID, imageURL.path)
+        }
+        let image = CIImage(cgImage: cgImage)
+        trace("image decoded image_id=\(entry.imageID) frame=0 path=\(imageURL.path)")
+        return image
     }
 
     private static func trace(_ message: String) {
@@ -195,6 +282,8 @@ enum FastVLMBenchmarkRunner {
         case missingManifestPath
         case missingOutputPath
         case emptyManifest
+        case invalidVariant(String)
+        case invalidWarmupRuns(String)
         case invalidImage(String, String)
         case generationFailed(String, FastVLMVariant, String)
         case encodingFailed
@@ -207,6 +296,10 @@ enum FastVLMBenchmarkRunner {
                 return "FASTVLM_BENCHMARK_OUTPUT was not provided."
             case .emptyManifest:
                 return "Benchmark manifest is empty."
+            case .invalidVariant(let value):
+                return "FASTVLM_BENCHMARK_VARIANT must be int8 or int4, found '\(value)'."
+            case .invalidWarmupRuns(let value):
+                return "FASTVLM_BENCHMARK_WARMUP_RUNS must be a non-negative integer, found '\(value)'."
             case .invalidImage(let imageID, let path):
                 return "Could not decode benchmark image \(imageID) at \(path)."
             case .generationFailed(let imageID, let variant, let output):
