@@ -185,6 +185,7 @@ class FastVLMModel {
 
         resetMetrics()
         running = true
+        let generationTokenLimit = effectiveGenerationTokenLimit
 
         // Cancel any existing task
         currentTask?.cancel()
@@ -243,7 +244,7 @@ class FastVLMModel {
                             }
                         }
 
-                        if tokens.count >= effectiveGenerationTokenLimit {
+                        if tokens.count >= generationTokenLimit {
                             return .stop
                         } else {
                             return .more
