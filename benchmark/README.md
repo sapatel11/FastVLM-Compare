@@ -1,15 +1,20 @@
-# FastVLM-Compare local benchmark
+# FastVLM-Compare benchmark
 
-This directory contains the controlled **local Apple Silicon** measurement workflow for the FastVLM-0.5B Stage 3 INT8-vs-INT4 comparison.
+This directory contains the controlled measurement workflow for the FastVLM-0.5B Stage 3 INT8-vs-INT4 comparison.
 
-GitHub Actions remains infrastructure validation only. Do not use hosted-runner timings as final project results.
+The project's final measurements are now produced on a **GitHub-hosted Apple Silicon macOS runner** because no dedicated local Mac is available. The original one-image workflow remains an infrastructure smoke test; final results come only from the separate manually triggered workflow:
 
-## Protocol
+`FastVLM final hosted benchmark`
 
-The default local protocol is intentionally small but repeatable:
+This is an explicit experimental limitation. The final report must describe the environment as GitHub-hosted Apple Silicon and must not claim that the results are dedicated bare-metal or local-Mac measurements.
 
-- Target: a native Apple Silicon Mac (`Darwin/arm64`).
+## Final protocol
+
+The final hosted protocol is intentionally small but repeatable:
+
+- Environment: GitHub-hosted `macos-15` Apple Silicon runner.
 - Model: the same FastVLM-0.5B Stage 3 checkpoint for both variants.
+- Build: Release configuration.
 - Vision encoder: shared between INT8 and INT4.
 - LLM quantization: 8-bit vs 4-bit, group size 64.
 - Decoding: temperature `0.0`.
@@ -25,84 +30,66 @@ The default local protocol is intentionally small but repeatable:
 - Total-latency start: same point as TTFT.
 - Total-latency end: generation completion.
 
-With five images and five repetitions, the default protocol produces **50 measured records**: 25 INT8 and 25 INT4. Warm-up generations are not written to the measurement JSONL.
+With five images and five repetitions, the workflow produces **50 measured records**: 25 INT8 and 25 INT4. Warm-up generations are not written to the measurement JSONL.
 
 ### Why separate processes?
 
-The CI smoke harness can execute both variants in one process because its job is only to prove that the native benchmark works.
+The existing CI smoke harness can execute both variants in one process because its job is only to prove that the native benchmark works.
 
-For final measurements, separate processes reduce cross-variant contamination from model residency, MLX state, and caches. Alternating the order between repetitions also reduces systematic thermal/order bias.
+The final benchmark instead starts a fresh application process for each variant session. This reduces cross-variant contamination from model residency, MLX state, and caches. Alternating the variant order between repetitions also reduces systematic order effects.
 
-### Before running
+## Run the final benchmark
 
-Use the same Mac for the entire comparison. Run natively on Apple Silicon, connect the Mac to power, disable Low Power Mode, and close heavy background workloads. Start the experiment from a reasonably idle machine and avoid changing system conditions during the run.
+The final benchmark is manual-only. It will never start automatically.
 
-The local runner records macOS/hardware information, the power-source report, repository commit, manifest hash, protocol settings, and discovered model-bundle sizes in `metadata.json`.
+1. Open the repository on GitHub.
+2. Open **Actions**.
+3. Select **FastVLM final hosted benchmark**.
+4. Choose **Run workflow**.
+5. Run it on `main`.
 
-## 1. Prepare the local app
-
-The final benchmark must use locally generated model artifacts because CI artifacts are intentionally ephemeral.
-
-The helper below mirrors the pinned checkpoint, dependency, export, quantization, and staging choices used by the validated workflow. It builds the local benchmark app in **Release** configuration by default:
-
-```bash
-PYTHON_BIN=python3.10 bash benchmark/prepare_local_app.sh
-```
-
-The script prints the built `.app` path when it succeeds.
-
-Heavy intermediate files are stored under `~/Library/Caches/FastVLM-Compare/` by default. The staged model resources remain under the already-ignored `app/FastVLM/model` directory.
-
-## 2. Run the benchmark
-
-Use the `.app` path printed by the preparation script:
-
-```bash
-python3 benchmark/run_local_benchmark.py \
-  --app "/absolute/path/to/FastVLM App.app"
-```
-
-Useful overrides:
-
-```bash
-python3 benchmark/run_local_benchmark.py \
-  --app "/absolute/path/to/FastVLM App.app" \
-  --repetitions 5 \
-  --warmups 1 \
-  --max-tokens 64
-```
-
-Do not change these settings between variants. The runner itself applies the same settings to both.
-
-Results are written under:
+The workflow performs the complete experiment in one hosted job:
 
 ```text
-benchmark/results/<timestamp>/
-    metadata.json
-    measurements.jsonl
-    raw/
-    logs/
+checkout
+  ↓
+prepare pinned FastVLM-0.5B Stage 3 checkpoint
+  ↓
+export shared Core ML vision encoder
+  ↓
+convert 8-bit LLM
+  ↓
+convert 4-bit LLM
+  ↓
+build Release macOS app
+  ↓
+1 warm-up + 5 measured repetitions
+  ↓
+alternate INT8/INT4 order in fresh processes
+  ↓
+50 raw measurements
+  ↓
+aggregate analysis
+  ↓
+upload results artifact
 ```
 
-Each raw process output uses the existing Swift JSONL schema. `measurements.jsonl` adds only:
+The workflow does **not** upload model checkpoints, quantized model bundles, or the built application.
 
-- `repetition`
-- `order_in_repetition`
+## Results artifact
 
-These annotations let the analysis pair equivalent INT8/INT4 runs without changing the CI smoke-test schema.
+A successful or partially completed run uploads:
 
-## 3. Analyze results
+`fastvlm-final-benchmark-results`
 
-Run:
-
-```bash
-python3 benchmark/analyze_results.py \
-  benchmark/results/<timestamp>/measurements.jsonl
-```
-
-This creates:
+The artifact contains the benchmark data and diagnostics only:
 
 ```text
+metadata.json
+measurements.jsonl
+raw/
+logs/
+analysis-console.txt
 analysis/
     summary.json
     summary.md
@@ -110,34 +97,65 @@ analysis/
     captions.md
 ```
 
-The summary reports:
+`metadata.json` records the runner/macOS/hardware information, repository commit, manifest hash, protocol settings, and discovered model-bundle sizes.
+
+`measurements.jsonl` contains the measured rows plus:
+
+- `repetition`
+- `order_in_repetition`
+
+The analysis reports:
 
 - median and mean TTFT
 - median and mean total latency
 - median and mean tokens/second
 - median generated-token count
 - INT4 relative improvement for TTFT, total latency, and throughput
-- INT4 LLM-bundle storage reduction and effective LLM-plus-shared-vision reduction when sizes were discovered
+- INT4 LLM-bundle storage reduction
+- effective LLM-plus-shared-vision storage reduction
 - exact caption agreement as a reproducibility signal
 
-`captions.md` intentionally presents paired captions for manual review. Exact string agreement is **not** treated as a semantic quality metric.
+`captions.md` presents paired captions for manual quality review. Exact string agreement is **not** treated as a semantic quality metric.
 
 ## Dataset
 
-`benchmark_manifest.json` is a self-contained practical suite using assets already versioned in the repository. It covers a chart/diagram, a flexible-prompt visual, counting, emoji/symbol interpretation, and handwriting/text reading.
+`benchmark_manifest.json` is a small fixed suite using assets already versioned in the repository. It covers:
+
+- chart/diagram understanding
+- general visual description
+- counting
+- emoji/symbol interpretation
+- handwriting/text reading
 
 Animated GIF assets are decoded deterministically from frame 0 by the Swift benchmark runner.
 
 This is not intended to replace a large academic multimodal benchmark. Its purpose is to provide a fixed, reproducible set of distinct visual tasks for the engineering comparison.
 
-The existing `benchmark_manifest.example.json` remains the one-image CI smoke manifest.
+The existing `benchmark_manifest.example.json` remains the one-image smoke-test manifest.
 
-## Interpreting the metrics
+## Interpreting the results
 
-A lower TTFT is better. A lower total latency is generally better, but total latency is also affected by how many tokens each variant generated, so read it together with generated-token count and tokens/second.
+A lower TTFT is better.
+
+A lower total latency is generally better, but total latency is also affected by how many tokens each variant generates. Read it together with generated-token count and tokens/second.
 
 A higher tokens/second value is better for decoder throughput.
 
-Model loading is intentionally excluded from TTFT and total latency. This keeps the experiment focused on input preparation plus inference/generation. If cold-start/model-load performance becomes a project goal later, measure it as a separate metric rather than mixing it into these values.
+Model loading is intentionally excluded from TTFT and total latency. This keeps the experiment focused on multimodal input preparation plus inference/generation.
 
-For output quality, inspect whether each caption preserves the correct objects/text/counts, important details, coherence, and whether one variant introduces hallucinations. Do not claim that one variant has better semantic quality from exact-string matching alone.
+For output quality, inspect whether each caption preserves the correct objects, text, counts, and important details; remains coherent; and avoids new hallucinations. Do not infer semantic quality from exact-string matching alone.
+
+Most importantly, the final conclusion must remain scoped to the environment actually measured:
+
+> These results compare FastVLM-0.5B INT8 and INT4 under the same controlled procedure on a GitHub-hosted Apple Silicon macOS runner. Hosted-runner virtualization and shared-infrastructure variability are limitations, so the results should not be presented as dedicated bare-metal Mac performance.
+
+## Optional local path
+
+The local helpers remain available if a physical Apple Silicon Mac becomes available later:
+
+```bash
+PYTHON_BIN=python3.10 bash benchmark/prepare_local_app.sh
+python3 benchmark/run_local_benchmark.py --app "/absolute/path/to/FastVLM App.app"
+```
+
+That local path uses the same five-image, five-repetition protocol and can provide a future bare-metal comparison without redesigning the benchmark.

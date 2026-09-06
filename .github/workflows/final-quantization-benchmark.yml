@@ -1,0 +1,196 @@
+name: FastVLM final hosted benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fastvlm-final-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Controlled INT8 vs INT4 benchmark on Apple Silicon
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    env:
+      FASTVLM_LOCAL_ROOT: ${{ runner.temp }}/fastvlm-final
+      FASTVLM_BUILD_CONFIGURATION: Release
+      PYTHON_BIN: python
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Record hosted runner context
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## FastVLM final hosted benchmark"
+            echo
+            echo "This run is the project's controlled comparison environment."
+            echo
+            echo "> Limitation: measurements come from a GitHub-hosted Apple Silicon macOS runner, not a dedicated physical Mac. Interpret the results as a paired INT8-vs-INT4 comparison on this hosted environment."
+            echo
+            echo '```text'
+            sw_vers
+            uname -a
+            system_profiler SPHardwareDataType
+            xcodebuild -version
+            python --version
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare Release app with INT8 and INT4 models
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash benchmark/prepare_local_app.sh
+
+      - name: Locate built benchmark app
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_ROOT="$FASTVLM_LOCAL_ROOT/FastVLMDerivedData/Build/Products/Release"
+          APP_COUNT="$(find "$BUILD_ROOT" -maxdepth 1 -type d -name '*.app' -print | wc -l | tr -d ' ')"
+          if [[ "$APP_COUNT" -ne 1 ]]; then
+            echo "Expected one Release .app under $BUILD_ROOT, found $APP_COUNT." >&2
+            find "$BUILD_ROOT" -maxdepth 1 -type d -name '*.app' -print >&2
+            exit 1
+          fi
+
+          APP_PATH="$(find "$BUILD_ROOT" -maxdepth 1 -type d -name '*.app' -print | head -n 1)"
+          echo "FASTVLM_FINAL_APP=$APP_PATH" >> "$GITHUB_ENV"
+          echo "Final benchmark app: $APP_PATH"
+
+      - name: Run controlled final benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESULTS="$RUNNER_TEMP/fastvlm-final-results"
+          rm -rf "$RESULTS"
+
+          python benchmark/run_local_benchmark.py \
+            --app "$FASTVLM_FINAL_APP" \
+            --manifest benchmark/benchmark_manifest.json \
+            --output-dir "$RESULTS" \
+            --repetitions 5 \
+            --warmups 1 \
+            --max-tokens 64 \
+            --timeout-seconds 1800
+
+      - name: Analyze final benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESULTS="$RUNNER_TEMP/fastvlm-final-results"
+
+          python benchmark/analyze_results.py \
+            "$RESULTS/measurements.jsonl" \
+            --metadata "$RESULTS/metadata.json" \
+            --output-dir "$RESULTS/analysis" \
+            > "$RESULTS/analysis-console.txt"
+
+          python - "$RESULTS/analysis/summary.md" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          text = text.replace(
+              "# FastVLM INT8 vs INT4 local benchmark",
+              "# FastVLM INT8 vs INT4 GitHub-hosted benchmark",
+              1,
+          )
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          {
+            echo
+            echo "## Final benchmark results"
+            echo
+            cat "$RESULTS/analysis/summary.md"
+            echo
+            echo "### Environment limitation"
+            echo
+            echo "These are controlled paired measurements from a GitHub-hosted Apple Silicon macOS runner. They are not bare-metal/local-Mac measurements."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate final result set
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESULTS="$RUNNER_TEMP/fastvlm-final-results"
+
+          python - "$RESULTS/measurements.jsonl" "$RESULTS/metadata.json" <<'PY'
+          import json
+          import sys
+          from collections import Counter
+          from pathlib import Path
+
+          measurements = Path(sys.argv[1])
+          metadata_path = Path(sys.argv[2])
+
+          records = [
+              json.loads(line)
+              for line in measurements.read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+          if len(records) != 50:
+              raise SystemExit(f"Expected 50 measured records, found {len(records)}.")
+
+          counts = Counter(record["variant"] for record in records)
+          if counts != {"8-bit": 25, "4-bit": 25}:
+              raise SystemExit(f"Unexpected variant counts: {dict(counts)}")
+
+          images = {record["image_id"] for record in records}
+          repetitions = {int(record["repetition"]) for record in records}
+          if len(images) != 5 or repetitions != {1, 2, 3, 4, 5}:
+              raise SystemExit(
+                  f"Unexpected dataset/repetition coverage: images={len(images)} repetitions={sorted(repetitions)}"
+              )
+
+          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+          if metadata.get("status") != "completed":
+              raise SystemExit(f"Benchmark metadata status is not completed: {metadata.get('status')!r}")
+
+          for required in (
+              Path(sys.argv[1]).parent / "analysis" / "summary.json",
+              Path(sys.argv[1]).parent / "analysis" / "summary.md",
+              Path(sys.argv[1]).parent / "analysis" / "per_image.csv",
+              Path(sys.argv[1]).parent / "analysis" / "captions.md",
+          ):
+              if not required.is_file() or required.stat().st_size == 0:
+                  raise SystemExit(f"Missing final analysis artifact: {required}")
+
+          print("FASTVLM_FINAL_BENCHMARK PASS records=50 int8=25 int4=25 images=5 repetitions=5")
+          PY
+
+      - name: Upload final benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastvlm-final-benchmark-results
+          path: ${{ runner.temp }}/fastvlm-final-results
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Confirm heavyweight outputs remain ephemeral
+        if: always()
+        shell: bash
+        run: |
+          set -eo pipefail
+          rm -rf "$GITHUB_WORKSPACE/app/FastVLM/model"
+          rm -rf "$FASTVLM_LOCAL_ROOT"
+          echo "Model checkpoints, quantized weights, and the built app were not uploaded."
+          echo "Only benchmark measurements, logs, metadata, captions, and aggregate analysis are retained as the workflow artifact."
+          git status --short
