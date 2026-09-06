@@ -1202,6 +1202,7 @@ jobs:
           import os
           import plistlib
           import subprocess
+          import threading
           from pathlib import Path
 
           build_root = Path(os.environ["RUNNER_TEMP"]) / "FastVLMDerivedData/Build/Products/Debug"
@@ -1228,60 +1229,112 @@ jobs:
               raise SystemExit(f"Benchmark manifest was not found: {manifest}")
 
           output = Path(os.environ["RUNNER_TEMP"]) / "fastvlm-benchmark-smoke.jsonl"
+          diagnostic_log = Path(os.environ["RUNNER_TEMP"]) / "fastvlm-benchmark-smoke.log"
           output.unlink(missing_ok=True)
+          diagnostic_log.unlink(missing_ok=True)
 
           env = os.environ.copy()
           env["FASTVLM_BENCHMARK"] = "1"
           env["FASTVLM_BENCHMARK_MANIFEST"] = str(manifest)
           env["FASTVLM_BENCHMARK_OUTPUT"] = str(output)
 
-          print("Launching native benchmark harness:", executable, flush=True)
-          try:
-              result = subprocess.run(
-                  [str(executable)],
-                  env=env,
-                  capture_output=True,
-                  text=True,
-                  timeout=1800,
-              )
-          except subprocess.TimeoutExpired as error:
-              def decode_stream(value):
-                  if value is None:
-                      return ""
-                  if isinstance(value, bytes):
-                      return value.decode("utf-8", errors="replace")
-                  return value
+          captured_output = []
+          returncode = None
+          timed_out = False
 
-              stdout = decode_stream(error.stdout)
-              stderr = decode_stream(error.stderr)
-              print("FASTVLM_BENCHMARK timeout partial stdout:", flush=True)
-              print(stdout or "<empty>", flush=True)
-              print("FASTVLM_BENCHMARK timeout partial stderr:", flush=True)
-              print(stderr or "<empty>", flush=True)
-              print(
-                  f"FASTVLM_BENCHMARK output exists at timeout: {output.is_file()} path={output}",
-                  flush=True,
+          def append_diagnostic(text: str) -> None:
+              print(text, flush=True)
+              with diagnostic_log.open("a", encoding="utf-8") as handle:
+                  handle.write(text + "\n")
+
+          def fail(message: str) -> None:
+              append_diagnostic(f"FASTVLM_BENCHMARK failure: {message}")
+              append_diagnostic(
+                  f"FASTVLM_BENCHMARK process_exit_code={returncode} timed_out={str(timed_out).lower()}"
+              )
+              append_diagnostic(
+                  f"FASTVLM_BENCHMARK output_exists={output.is_file()} path={output}"
               )
               if output.is_file():
-                  print("FASTVLM_BENCHMARK partial JSONL:", flush=True)
-                  print(output.read_text(encoding="utf-8", errors="replace") or "<empty>", flush=True)
-              raise SystemExit("Native benchmark harness timed out after 1800 seconds.") from error
+                  partial_jsonl = output.read_text(encoding="utf-8", errors="replace")
+                  append_diagnostic("FASTVLM_BENCHMARK partial JSONL:")
+                  append_diagnostic(partial_jsonl.rstrip("\n") or "<empty>")
+              else:
+                  append_diagnostic("FASTVLM_BENCHMARK partial JSONL: <missing>")
+              raise SystemExit(message)
 
-          combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
-          print(combined_output, flush=True)
+          launch_line = f"Launching native benchmark harness: {executable}"
+          print(launch_line, flush=True)
+          with diagnostic_log.open("w", encoding="utf-8") as log_handle:
+              log_handle.write(launch_line + "\n")
+              log_handle.flush()
 
-          if result.returncode != 0:
-              raise SystemExit(f"Native benchmark harness exited with code {result.returncode}.")
+              try:
+                  process = subprocess.Popen(
+                      [str(executable)],
+                      env=env,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                      encoding="utf-8",
+                      errors="replace",
+                      bufsize=1,
+                  )
+              except OSError as error:
+                  fail(f"Native benchmark harness failed to launch: {error}")
+
+              if process.stdout is None:
+                  process.kill()
+                  returncode = process.wait()
+                  fail("Native benchmark harness stdout pipe was not created.")
+
+              def stream_child_output() -> None:
+                  for line in process.stdout:
+                      captured_output.append(line)
+                      print(line, end="", flush=True)
+                      log_handle.write(line)
+                      log_handle.flush()
+
+              reader = threading.Thread(target=stream_child_output, daemon=True)
+              reader.start()
+
+              try:
+                  returncode = process.wait(timeout=1800)
+              except subprocess.TimeoutExpired:
+                  timed_out = True
+                  process.kill()
+                  returncode = process.wait()
+              finally:
+                  reader.join()
+
+              status_line = (
+                  f"FASTVLM_BENCHMARK process_exit_code={returncode} "
+                  f"timed_out={str(timed_out).lower()}"
+              )
+              print(status_line, flush=True)
+              log_handle.write(status_line + "\n")
+              log_handle.flush()
+
+          combined_output = "".join(captured_output)
+
+          if timed_out:
+              fail("Native benchmark harness timed out after 1800 seconds.")
+          if returncode != 0:
+              fail(f"Native benchmark harness exited with code {returncode}.")
           if "FASTVLM_BENCHMARK PASS all records=2" not in combined_output:
-              raise SystemExit("Native benchmark harness did not report exactly two successful records.")
+              fail("Native benchmark harness did not report exactly two successful records.")
           if not output.is_file():
-              raise SystemExit(f"Native benchmark output was not written: {output}")
+              fail(f"Native benchmark output was not written: {output}")
 
           lines = [line for line in output.read_text(encoding="utf-8").splitlines() if line.strip()]
           if len(lines) != 2:
-              raise SystemExit(f"Expected exactly two benchmark JSONL rows, found {len(lines)}")
+              fail(f"Expected exactly two benchmark JSONL rows, found {len(lines)}")
 
-          records = [json.loads(line) for line in lines]
+          try:
+              records = [json.loads(line) for line in lines]
+          except json.JSONDecodeError as error:
+              fail(f"Benchmark output contains invalid JSON: {error}")
+
           expected_fields = {
               "image_id",
               "variant",
@@ -1294,31 +1347,33 @@ jobs:
           variants = set()
           for record in records:
               if set(record) != expected_fields:
-                  raise SystemExit(
-                      f"Benchmark row fields differ from the expected schema: {sorted(record)}"
-                  )
+                  fail(f"Benchmark row fields differ from the expected schema: {sorted(record)}")
               if record["image_id"] != "repo-smoke-001":
-                  raise SystemExit(f"Unexpected benchmark image_id: {record['image_id']!r}")
+                  fail(f"Unexpected benchmark image_id: {record['image_id']!r}")
               if not isinstance(record["caption"], str) or not record["caption"].strip():
-                  raise SystemExit("Benchmark row contains an empty caption.")
+                  fail("Benchmark row contains an empty caption.")
 
-              ttft = float(record["TTFT_ms"])
-              total = float(record["total_latency_ms"])
-              tokens = int(record["generated_tokens"])
-              tokens_per_second = float(record["tokens_per_second"])
+              try:
+                  ttft = float(record["TTFT_ms"])
+                  total = float(record["total_latency_ms"])
+                  tokens = int(record["generated_tokens"])
+                  tokens_per_second = float(record["tokens_per_second"])
+              except (TypeError, ValueError) as error:
+                  fail(f"Benchmark row contains invalid metric types: {error}")
+
               if not math.isfinite(ttft) or ttft <= 0:
-                  raise SystemExit(f"Invalid benchmark TTFT: {ttft}")
+                  fail(f"Invalid benchmark TTFT: {ttft}")
               if not math.isfinite(total) or total < ttft:
-                  raise SystemExit(f"Invalid benchmark total latency: {total}")
+                  fail(f"Invalid benchmark total latency: {total}")
               if tokens <= 0:
-                  raise SystemExit(f"Invalid benchmark generated token count: {tokens}")
+                  fail(f"Invalid benchmark generated token count: {tokens}")
               if not math.isfinite(tokens_per_second) or tokens_per_second <= 0:
-                  raise SystemExit(f"Invalid benchmark tokens/sec: {tokens_per_second}")
+                  fail(f"Invalid benchmark tokens/sec: {tokens_per_second}")
 
               variants.add(record["variant"])
 
           if variants != {"8-bit", "4-bit"}:
-              raise SystemExit(f"Expected 8-bit and 4-bit benchmark rows, found {sorted(variants)}")
+              fail(f"Expected 8-bit and 4-bit benchmark rows, found {sorted(variants)}")
 
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
               handle.write("\n## Native benchmark harness validation\n\n")
@@ -1329,6 +1384,15 @@ jobs:
               handle.write("- Metrics/schema validation: PASS\n\n")
               handle.write("These GitHub virtual-M1 measurements are harness smoke data, not scientific benchmark results.\n")
           PY
+
+      - name: Upload benchmark diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastvlm-benchmark-smoke-diagnostics
+          path: ${{ runner.temp }}/fastvlm-benchmark-smoke.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload quantization summary only
         if: always()
@@ -1344,9 +1408,9 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-          echo "Removing staged app resources, quantized weights, checkpoint files, benchmark smoke output, and derived build products."
+          echo "Removing staged app resources, quantized weights, checkpoint files, benchmark smoke output, diagnostics, and derived build products."
           rm -rf "$GITHUB_WORKSPACE/app/FastVLM/model"
-          rm -f "$RUNNER_TEMP/fastvlm-benchmark-smoke.jsonl"
+          rm -f "$RUNNER_TEMP/fastvlm-benchmark-smoke.jsonl" "$RUNNER_TEMP/fastvlm-benchmark-smoke.log"
           if [[ -n "${FASTVLM_8BIT_DIR:-}" ]]; then
             rm -rf "$FASTVLM_8BIT_DIR"
           fi
