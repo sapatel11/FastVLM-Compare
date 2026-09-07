@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 180
 
     env:
-      FASTVLM_LOCAL_ROOT: ${{ runner.temp }}/fastvlm-final
+      FASTVLM_LOCAL_ROOT: ${{ github.workspace }}/.fastvlm-final
       FASTVLM_BUILD_CONFIGURATION: Release
       PYTHON_BIN: python
 
